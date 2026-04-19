@@ -17,3 +17,4 @@ dagger:
   n_trajectories: 2            # policy rollouts collected per iteration
   save_path: policy_model.keras  # checkpoint path; set to null to disable
   load_path: null              # resume from this .keras file; null → fresh model
+  n_workers: null              # worker processes for parallel MCTS labeling; null → all CPUs

@@ -24,6 +24,8 @@ Speedups over imitation_learning.py
 """
 from __future__ import annotations
 
+import multiprocessing as mp
+import os
 import sys
 import time
 import numpy as np
@@ -34,6 +36,24 @@ import jax.numpy as jnp
 from board import SquareBoard
 from fast_mcts_square import fast_mcts, _move_table, _board_to_flat, _run_rollout
 from policy_network_square import select_action
+
+
+# ── Parallel MCTS workers ─────────────────────────────────────────────────────
+# Must be module-level for pickling under 'spawn'.  Each worker warms up the
+# JAX XLA kernel once in its initializer so timed MCTS calls pay no compile cost.
+
+_worker_time_limit: float = 1.0
+
+
+def _mcts_worker_init(n: int, time_limit: float) -> None:
+    global _worker_time_limit
+    _worker_time_limit = time_limit
+    warmup_jax_kernel(SquareBoard(n))
+
+
+def _mcts_label_one(args: tuple) -> tuple[int, tuple | None]:
+    idx, board = args
+    return idx, fast_mcts(board, time_limit=_worker_time_limit)
 
 
 # ── JAX warm-up ───────────────────────────────────────────────────────────────
@@ -143,13 +163,15 @@ def dagger(
     mcts_time_limit: float = 1.0,
     n_trajectories: int = 1,
     save_path: str | None = "policy_model.keras",
+    n_workers: int | None = None,
 ) -> keras.Model:
     """DAgger using fast_mcts as the teacher, for SquareBoard.
 
     Differences from imitation_learning.dagger():
       - fast_mcts (JAX lax.scan rollouts, flat-array tree) labels each state.
-      - JAX rollout kernel is warmed up once before the iteration loop so no
-        compilation cost is paid inside the timed MCTS budget.
+      - MCTS labeling is parallelized across n_workers processes (default:
+        os.cpu_count()).  Each worker warms up the JAX XLA kernel once in its
+        initializer; the pool is reused across all DAgger iterations.
       - Training uses jit_compile=True compiled once before iteration 1 and
         reused on every subsequent learn() call without retracing.
       - n_trajectories trajectories are rolled out per iteration, diversifying
@@ -164,12 +186,11 @@ def dagger(
     mcts_time_limit — wall-clock seconds given to fast_mcts per state
     n_trajectories  — trajectories rolled out per iteration (default 1)
     save_path       — save model after each iteration; None disables saving
+    n_workers       — worker processes for parallel MCTS labeling (default: all CPUs)
 
     Returns the final updated policy.
     """
-    print("Warming up JAX rollout kernel...")
-    warmup_jax_kernel(initial_board)
-    print("JAX rollout kernel ready.")
+    n_workers = n_workers or (os.cpu_count() or 1)
 
     # Pre-compile the training step before iteration 1 so the first learn()
     # call does not pay XLA compilation cost mid-loop.
@@ -179,65 +200,85 @@ def dagger(
     pi = pi0
     run_start = time.perf_counter()
 
-    for i in range(n_iterations):
-        iter_start = time.perf_counter()
-        elapsed_total = iter_start - run_start
-        print(f"\n{'='*60}")
-        print(f"DAgger iteration {i + 1}/{n_iterations}  "
-              f"(elapsed {elapsed_total:.0f}s, dataset {len(D)} samples)")
-        print(f"{'='*60}")
+    # 'spawn' is required: JAX initializes device handles that don't survive fork.
+    # Workers warm up the XLA kernel once in their initializer.
+    ctx = mp.get_context("spawn")
+    print(f"Spawning {n_workers} MCTS worker process(es) and warming up JAX...")
+    with ctx.Pool(
+        processes=n_workers,
+        initializer=_mcts_worker_init,
+        initargs=(initial_board.n, mcts_time_limit),
+    ) as pool:
+        print("Workers ready.")
 
-        new_samples = 0
+        for i in range(n_iterations):
+            iter_start = time.perf_counter()
+            elapsed_total = iter_start - run_start
+            print(f"\n{'='*60}")
+            print(f"DAgger iteration {i + 1}/{n_iterations}  "
+                  f"(elapsed {elapsed_total:.0f}s, dataset {len(D)} samples)")
+            print(f"{'='*60}")
 
-        for t in range(n_trajectories):
-            traj_start = time.perf_counter()
-            trajectory, final_board = _gen_trajectory(pi, initial_board)
-            traj_time = time.perf_counter() - traj_start
-            pegs_left = int(final_board.encode().sum())
+            new_samples = 0
 
-            traj_label = f"trajectory {t + 1}/{n_trajectories}" if n_trajectories > 1 else "trajectory"
-            print(f"\n  [{traj_label}]  {len(trajectory)} steps, "
-                  f"{pegs_left} peg(s) remaining  ({traj_time:.2f}s)")
+            for t in range(n_trajectories):
+                traj_start = time.perf_counter()
+                trajectory, final_board = _gen_trajectory(pi, initial_board)
+                traj_time = time.perf_counter() - traj_start
+                pegs_left = int(final_board.encode().sum())
 
-            # MCTS labeling with inline progress
-            n_states  = len(trajectory)
-            labeled   = 0
-            skipped   = 0
-            label_start = time.perf_counter()
-            for j, state in enumerate(trajectory):
-                move = fast_mcts(state, time_limit=mcts_time_limit)
-                pct  = (j + 1) / n_states * 100
-                elapsed_label = time.perf_counter() - label_start
-                rate = (j + 1) / elapsed_label if elapsed_label > 0 else 0
-                sys.stdout.write(
-                    f"\r  labeling: {j+1:>{len(str(n_states))}}/{n_states} "
-                    f"({pct:5.1f}%)  {rate:.1f} states/s  "
-                    f"skipped={skipped}     "
-                )
-                sys.stdout.flush()
-                if move is None:
-                    skipped += 1
-                    continue
-                D.append((state.encode(), state.encode_move(move)))
-                labeled += 1
-                new_samples += 1
+                traj_label = f"trajectory {t + 1}/{n_trajectories}" if n_trajectories > 1 else "trajectory"
+                print(f"\n  [{traj_label}]  {len(trajectory)} steps, "
+                      f"{pegs_left} peg(s) remaining  ({traj_time:.2f}s)")
 
-            label_time = time.perf_counter() - label_start
-            sys.stdout.write("\n")
-            print(f"  labeled {labeled}/{n_states} states  "
-                  f"(skipped {skipped})  in {label_time:.1f}s  "
-                  f"avg {label_time/n_states:.2f}s/state")
+                # Parallel MCTS labeling — each state is independent.
+                n_states    = len(trajectory)
+                label_start = time.perf_counter()
+                raw_results: list[tuple[int, tuple | None]] = []
 
-        print(f"\n  dataset: {len(D)} total  (+{new_samples} this iteration)")
-        print(f"  --- training ---")
-        pi = learn(D, pi, optimizer, epochs, batch_size)
+                for done, (idx, move) in enumerate(
+                    pool.imap_unordered(_mcts_label_one, enumerate(trajectory)),
+                    start=1,
+                ):
+                    raw_results.append((idx, move))
+                    pct  = done / n_states * 100
+                    elapsed_label = time.perf_counter() - label_start
+                    rate = done / elapsed_label if elapsed_label > 0 else 0
+                    sys.stdout.write(
+                        f"\r  labeling: {done:>{len(str(n_states))}}/{n_states} "
+                        f"({pct:5.1f}%)  {rate:.1f} states/s  "
+                        f"workers={n_workers}     "
+                    )
+                    sys.stdout.flush()
 
-        if save_path:
-            pi.save(save_path)
-            print(f"  model saved → {save_path}")
+                label_time = time.perf_counter() - label_start
+                sys.stdout.write("\n")
 
-        iter_time = time.perf_counter() - iter_start
-        print(f"\n  iteration {i+1} complete in {iter_time:.1f}s")
+                labeled = 0
+                skipped = 0
+                for idx, move in raw_results:
+                    if move is None:
+                        skipped += 1
+                        continue
+                    state = trajectory[idx]
+                    D.append((state.encode(), state.encode_move(move)))
+                    labeled += 1
+                    new_samples += 1
+
+                print(f"  labeled {labeled}/{n_states} states  "
+                      f"(skipped {skipped})  in {label_time:.1f}s  "
+                      f"avg {label_time/n_states:.2f}s/state")
+
+            print(f"\n  dataset: {len(D)} total  (+{new_samples} this iteration)")
+            print(f"  --- training ---")
+            pi = learn(D, pi, optimizer, epochs, batch_size)
+
+            if save_path:
+                pi.save(save_path)
+                print(f"  model saved → {save_path}")
+
+            iter_time = time.perf_counter() - iter_start
+            print(f"\n  iteration {i+1} complete in {iter_time:.1f}s")
 
     total_time = time.perf_counter() - run_start
     print(f"\n{'='*60}")
@@ -302,6 +343,7 @@ def main(config_path: str = "config.yaml") -> None:
         mcts_time_limit=dc["mcts_time_limit"],
         n_trajectories=dc.get("n_trajectories", 1),
         save_path=dc.get("save_path"),
+        n_workers=dc.get("n_workers"),
     )
 
 
