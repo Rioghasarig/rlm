@@ -24,6 +24,8 @@ Speedups over imitation_learning.py
 """
 from __future__ import annotations
 
+import sys
+import time
 import numpy as np
 import keras
 import jax
@@ -94,6 +96,7 @@ def learn(
 
     _ensure_jit_compiled(policy_model, optimizer)
 
+    t0 = time.perf_counter()
     history = policy_model.fit(
         states, actions,
         epochs=epochs,
@@ -101,23 +104,31 @@ def learn(
         shuffle=True,
         verbose=0,
     )
-    for ep, loss in enumerate(history.history["loss"], 1):
-        print(f"  epoch {ep}/{epochs}  loss={loss:.4f}")
+    train_time = time.perf_counter() - t0
+
+    losses = history.history["loss"]
+    for ep, loss in enumerate(losses, 1):
+        print(f"    epoch {ep:>{len(str(epochs))}}/{epochs}  loss={loss:.4f}")
+    print(f"  training: {train_time:.1f}s  "
+          f"loss {losses[0]:.4f} → {losses[-1]:.4f}  "
+          f"(Δ={losses[-1] - losses[0]:+.4f})")
 
     return policy_model
 
 
 # ── Trajectory generation ─────────────────────────────────────────────────────
 
-def _gen_trajectory(policy: keras.Model, board: SquareBoard) -> list[SquareBoard]:
-    """Roll out policy from board; return each state visited."""
+def _gen_trajectory(
+    policy: keras.Model, board: SquareBoard
+) -> tuple[list[SquareBoard], SquareBoard]:
+    """Roll out policy from board; return (states visited, terminal board)."""
     states: list[SquareBoard] = []
     b = board.copy()
     while b.available_moves():
         states.append(b.copy())
         move = select_action(policy, b)
         b.move(move[0], move[2])
-    return states
+    return states, b
 
 
 # ── DAgger ────────────────────────────────────────────────────────────────────
@@ -166,28 +177,74 @@ def dagger(
 
     D: list[tuple[np.ndarray, int]] = []
     pi = pi0
+    run_start = time.perf_counter()
 
     for i in range(n_iterations):
-        print(f"\n--- DAgger iteration {i + 1}/{n_iterations} ---")
+        iter_start = time.perf_counter()
+        elapsed_total = iter_start - run_start
+        print(f"\n{'='*60}")
+        print(f"DAgger iteration {i + 1}/{n_iterations}  "
+              f"(elapsed {elapsed_total:.0f}s, dataset {len(D)} samples)")
+        print(f"{'='*60}")
+
+        new_samples = 0
 
         for t in range(n_trajectories):
-            trajectory = _gen_trajectory(pi, initial_board)
-            if n_trajectories > 1:
-                print(f"  trajectory {t + 1}/{n_trajectories}: {len(trajectory)} states")
+            traj_start = time.perf_counter()
+            trajectory, final_board = _gen_trajectory(pi, initial_board)
+            traj_time = time.perf_counter() - traj_start
+            pegs_left = int(final_board.encode().sum())
 
-            for state in trajectory:
+            traj_label = f"trajectory {t + 1}/{n_trajectories}" if n_trajectories > 1 else "trajectory"
+            print(f"\n  [{traj_label}]  {len(trajectory)} steps, "
+                  f"{pegs_left} peg(s) remaining  ({traj_time:.2f}s)")
+
+            # MCTS labeling with inline progress
+            n_states  = len(trajectory)
+            labeled   = 0
+            skipped   = 0
+            label_start = time.perf_counter()
+            for j, state in enumerate(trajectory):
                 move = fast_mcts(state, time_limit=mcts_time_limit)
+                pct  = (j + 1) / n_states * 100
+                elapsed_label = time.perf_counter() - label_start
+                rate = (j + 1) / elapsed_label if elapsed_label > 0 else 0
+                sys.stdout.write(
+                    f"\r  labeling: {j+1:>{len(str(n_states))}}/{n_states} "
+                    f"({pct:5.1f}%)  {rate:.1f} states/s  "
+                    f"skipped={skipped}     "
+                )
+                sys.stdout.flush()
                 if move is None:
+                    skipped += 1
                     continue
                 D.append((state.encode(), state.encode_move(move)))
+                labeled += 1
+                new_samples += 1
 
-        print(f"  dataset size: {len(D)}")
+            label_time = time.perf_counter() - label_start
+            sys.stdout.write("\n")
+            print(f"  labeled {labeled}/{n_states} states  "
+                  f"(skipped {skipped})  in {label_time:.1f}s  "
+                  f"avg {label_time/n_states:.2f}s/state")
+
+        print(f"\n  dataset: {len(D)} total  (+{new_samples} this iteration)")
+        print(f"  --- training ---")
         pi = learn(D, pi, optimizer, epochs, batch_size)
 
         if save_path:
             pi.save(save_path)
             print(f"  model saved → {save_path}")
 
+        iter_time = time.perf_counter() - iter_start
+        print(f"\n  iteration {i+1} complete in {iter_time:.1f}s")
+
+    total_time = time.perf_counter() - run_start
+    print(f"\n{'='*60}")
+    print(f"DAgger complete: {n_iterations} iterations in {total_time:.1f}s  "
+          f"({total_time/n_iterations:.1f}s/iter avg)  "
+          f"dataset={len(D)}")
+    print(f"{'='*60}")
     return pi
 
 
