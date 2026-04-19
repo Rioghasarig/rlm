@@ -24,6 +24,7 @@ Speedups over imitation_learning.py
 """
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import os
 import sys
@@ -36,6 +37,17 @@ import jax.numpy as jnp
 from board import SquareBoard
 from fast_mcts_square import fast_mcts, _move_table, _board_to_flat, _run_rollout
 from policy_network_square import select_action
+
+
+# ── JSONL progress logging ────────────────────────────────────────────────────
+
+def _record(log_path: str | None, run_start: float, **fields) -> None:
+    if log_path is None:
+        return
+    fields["t"] = round(time.perf_counter() - run_start, 3)
+    os.makedirs(os.path.dirname(log_path), exist_ok=True) if os.path.dirname(log_path) else None
+    with open(log_path, "a") as f:
+        f.write(json.dumps(fields) + "\n")
 
 
 # ── Parallel MCTS workers ─────────────────────────────────────────────────────
@@ -96,6 +108,8 @@ def learn(
     optimizer: keras.optimizers.Optimizer,
     epochs: int,
     batch_size: int,
+    record_fn=None,
+    iteration: int | None = None,
 ) -> keras.Model:
     """Train policy_model on dataset D using an XLA-compiled training step.
 
@@ -129,6 +143,8 @@ def learn(
     losses = history.history["loss"]
     for ep, loss in enumerate(losses, 1):
         print(f"    epoch {ep:>{len(str(epochs))}}/{epochs}  loss={loss:.4f}")
+        if record_fn is not None:
+            record_fn(type="epoch_loss", iteration=iteration, epoch=ep, loss=round(float(loss), 6))
     print(f"  training: {train_time:.1f}s  "
           f"loss {losses[0]:.4f} → {losses[-1]:.4f}  "
           f"(Δ={losses[-1] - losses[0]:+.4f})")
@@ -160,10 +176,14 @@ def dagger(
     n_iterations: int,
     epochs: int,
     batch_size: int,
+    large_dataset_threshold: int | None = None,
+    large_dataset_epochs: int | None = None,
+    large_dataset_batch_size: int | None = None,
     mcts_time_limit: float = 1.0,
     n_trajectories: int = 1,
     save_path: str | None = "policy_model.keras",
     n_workers: int | None = None,
+    log_path: str | None = None,
 ) -> keras.Model:
     """DAgger using fast_mcts as the teacher, for SquareBoard.
 
@@ -177,16 +197,19 @@ def dagger(
       - n_trajectories trajectories are rolled out per iteration, diversifying
         the dataset with the current policy before MCTS labelling.
 
-    pi0             — initial policy from build_square_policy_network
-    initial_board   — starting board for every trajectory
-    optimizer       — e.g. keras.optimizers.Adam(1e-3)
-    n_iterations    — DAgger iterations
-    epochs          — learn() epochs per iteration
-    batch_size      — learn() batch size
-    mcts_time_limit — wall-clock seconds given to fast_mcts per state
-    n_trajectories  — trajectories rolled out per iteration (default 1)
-    save_path       — save model after each iteration; None disables saving
-    n_workers       — worker processes for parallel MCTS labeling (default: all CPUs)
+    pi0                      — initial policy from build_square_policy_network
+    initial_board            — starting board for every trajectory
+    optimizer                — e.g. keras.optimizers.Adam(1e-3)
+    n_iterations             — DAgger iterations
+    epochs                   — learn() epochs per iteration
+    batch_size               — learn() batch size
+    large_dataset_threshold  — dataset size at which to switch to larger epochs/batch; None → never switch
+    large_dataset_epochs     — epochs to use once dataset exceeds threshold
+    large_dataset_batch_size — batch size to use once dataset exceeds threshold
+    mcts_time_limit          — wall-clock seconds given to fast_mcts per state
+    n_trajectories           — trajectories rolled out per iteration (default 1)
+    save_path                — save model after each iteration; None disables saving
+    n_workers                — worker processes for parallel MCTS labeling (default: all CPUs)
 
     Returns the final updated policy.
     """
@@ -199,6 +222,21 @@ def dagger(
     D: list[tuple[np.ndarray, int]] = []
     pi = pi0
     run_start = time.perf_counter()
+
+    def record(**fields):
+        _record(log_path, run_start, **fields)
+
+    record(
+        type="run_start",
+        n_iterations=n_iterations,
+        n_trajectories=n_trajectories,
+        epochs=epochs,
+        batch_size=batch_size,
+        mcts_time_limit=mcts_time_limit,
+        n_workers=n_workers,
+        board_n=initial_board.n,
+        dataset_size=0,
+    )
 
     # 'spawn' is required: JAX initializes device handles that don't survive fork.
     # Workers warm up the XLA kernel once in their initializer.
@@ -218,6 +256,7 @@ def dagger(
             print(f"DAgger iteration {i + 1}/{n_iterations}  "
                   f"(elapsed {elapsed_total:.0f}s, dataset {len(D)} samples)")
             print(f"{'='*60}")
+            record(type="iteration_start", iteration=i + 1, dataset_size=len(D))
 
             new_samples = 0
 
@@ -230,6 +269,14 @@ def dagger(
                 traj_label = f"trajectory {t + 1}/{n_trajectories}" if n_trajectories > 1 else "trajectory"
                 print(f"\n  [{traj_label}]  {len(trajectory)} steps, "
                       f"{pegs_left} peg(s) remaining  ({traj_time:.2f}s)")
+                record(
+                    type="trajectory",
+                    iteration=i + 1,
+                    trajectory_idx=t,
+                    steps=len(trajectory),
+                    pegs_remaining=pegs_left,
+                    traj_time_s=round(traj_time, 3),
+                )
 
                 # Parallel MCTS labeling — each state is independent.
                 n_states    = len(trajectory)
@@ -268,10 +315,29 @@ def dagger(
                 print(f"  labeled {labeled}/{n_states} states  "
                       f"(skipped {skipped})  in {label_time:.1f}s  "
                       f"avg {label_time/n_states:.2f}s/state")
+                record(
+                    type="labeling",
+                    iteration=i + 1,
+                    trajectory_idx=t,
+                    labeled=labeled,
+                    skipped=skipped,
+                    label_time_s=round(label_time, 3),
+                    rate_states_per_s=round(labeled / label_time if label_time > 0 else 0, 2),
+                )
 
             print(f"\n  dataset: {len(D)} total  (+{new_samples} this iteration)")
             print(f"  --- training ---")
-            pi = learn(D, pi, optimizer, epochs, batch_size)
+            use_large = (
+                large_dataset_threshold is not None
+                and len(D) >= large_dataset_threshold
+            )
+            eff_epochs = (large_dataset_epochs or epochs) if use_large else epochs
+            eff_batch  = (large_dataset_batch_size or batch_size) if use_large else batch_size
+            if use_large:
+                print(f"  (large-dataset regime: epochs={eff_epochs}, batch_size={eff_batch})")
+            train_start = time.perf_counter()
+            pi = learn(D, pi, optimizer, eff_epochs, eff_batch, record_fn=record, iteration=i + 1)
+            train_time = time.perf_counter() - train_start
 
             if save_path:
                 pi.save(save_path)
@@ -279,6 +345,14 @@ def dagger(
 
             iter_time = time.perf_counter() - iter_start
             print(f"\n  iteration {i+1} complete in {iter_time:.1f}s")
+            record(
+                type="iteration_end",
+                iteration=i + 1,
+                dataset_size=len(D),
+                new_samples=new_samples,
+                train_time_s=round(train_time, 3),
+                iter_time_s=round(iter_time, 3),
+            )
 
     total_time = time.perf_counter() - run_start
     print(f"\n{'='*60}")
@@ -286,6 +360,7 @@ def dagger(
           f"({total_time/n_iterations:.1f}s/iter avg)  "
           f"dataset={len(D)}")
     print(f"{'='*60}")
+    record(type="run_end", total_time_s=round(total_time, 3), dataset_size=len(D))
     return pi
 
 
@@ -333,6 +408,15 @@ def main(config_path: str = "config.yaml") -> None:
 
     # DAgger
     dc = cfg["dagger"]
+
+    log_path = None
+    log_dir = dc.get("log_dir")
+    if log_dir is not None:
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(log_dir, f"{timestamp}_n{n}.jsonl")
+        print(f"Progress log → {log_path}")
+
     dagger(
         pi0=pi0,
         initial_board=board,
@@ -340,10 +424,14 @@ def main(config_path: str = "config.yaml") -> None:
         n_iterations=dc["n_iterations"],
         epochs=dc["epochs"],
         batch_size=dc["batch_size"],
+        large_dataset_threshold=dc.get("large_dataset_threshold"),
+        large_dataset_epochs=dc.get("large_dataset_epochs"),
+        large_dataset_batch_size=dc.get("large_dataset_batch_size"),
         mcts_time_limit=dc["mcts_time_limit"],
         n_trajectories=dc.get("n_trajectories", 1),
         save_path=dc.get("save_path"),
         n_workers=dc.get("n_workers"),
+        log_path=log_path,
     )
 
 
