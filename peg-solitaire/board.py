@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
 
+import numpy as np
+
 
 class Board(ABC):
     """Abstract base class for peg solitaire boards."""
@@ -16,14 +18,20 @@ class Board(ABC):
     @abstractmethod
     def move(self, from_pos: tuple[int, int], to_pos: tuple[int, int]) -> None: ...
 
-    def is_won(self) -> bool:
-        return len(self.pegs) == 1
+    @abstractmethod
+    def is_won(self) -> bool: ...
 
-    def copy(self) -> 'Board':
-        c = self.__class__.__new__(self.__class__)
-        c.n = self.n
-        c.pegs = self.pegs.copy()
-        return c
+    @abstractmethod
+    def copy(self) -> 'Board': ...
+
+    @abstractmethod
+    def encode(self) -> np.ndarray: ...
+
+    @abstractmethod
+    def encode_move(self, move: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]) -> int: ...
+
+    @abstractmethod
+    def decode_move(self, code: int) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]: ...
 
 
 class TriangularBoard(Board):
@@ -94,6 +102,37 @@ class TriangularBoard(Board):
         self.pegs.remove(from_pos)
         self.pegs.remove(over)
         self.pegs.add(to_pos)
+
+    def is_won(self) -> bool:
+        return len(self.pegs) == 1
+
+    def copy(self) -> 'TriangularBoard':
+        c = TriangularBoard.__new__(TriangularBoard)
+        c.n = self.n
+        c.pegs = self.pegs.copy()
+        return c
+
+    def encode(self) -> np.ndarray:
+        t = np.zeros((2, self.n, self.n), dtype=np.float32)
+        for row in range(self.n):
+            for col in range(row + 1):
+                t[1, row, col] = 1.0
+                t[0, row, col] = 1.0 if (row, col) in self.pegs else 0.0
+        return t
+
+    def encode_move(self, move: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]) -> int:
+        (r, c), _, _ = move
+        dr = move[2][0] - r
+        dc = move[2][1] - c
+        dir_idx = self._DIRECTIONS.index((dr // 2, dc // 2))
+        return (r * self.n + c) * len(self._DIRECTIONS) + dir_idx
+
+    def decode_move(self, code: int) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+        nd = len(self._DIRECTIONS)
+        flat, dir_idx = divmod(code, nd)
+        r, c = divmod(flat, self.n)
+        dr, dc = self._DIRECTIONS[dir_idx]
+        return (r, c), (r + dr, c + dc), (r + 2 * dr, c + 2 * dc)
 
     def __repr__(self) -> str:
         rows = []
@@ -169,6 +208,35 @@ class SquareBoard(Board):
         self.pegs.remove(from_pos)
         self.pegs.remove(over)
         self.pegs.add(to_pos)
+
+    def is_won(self) -> bool:
+        return len(self.pegs) == 1
+
+    def copy(self) -> 'SquareBoard':
+        c = SquareBoard.__new__(SquareBoard)
+        c.n = self.n
+        c.pegs = self.pegs.copy()
+        return c
+
+    def encode(self) -> np.ndarray:
+        t = np.zeros((self.n, self.n), dtype=np.float32)
+        for (r, c) in self.pegs:
+            t[r, c] = 1.0
+        return t
+
+    def encode_move(self, move: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]) -> int:
+        (r, c), _, _ = move
+        dr = move[2][0] - r
+        dc = move[2][1] - c
+        dir_idx = self._DIRECTIONS.index((dr // 2, dc // 2))
+        return (r * self.n + c) * len(self._DIRECTIONS) + dir_idx
+
+    def decode_move(self, code: int) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+        nd = len(self._DIRECTIONS)
+        flat, dir_idx = divmod(code, nd)
+        r, c = divmod(flat, self.n)
+        dr, dc = self._DIRECTIONS[dir_idx]
+        return (r, c), (r + dr, c + dc), (r + 2 * dr, c + 2 * dc)
 
     def __repr__(self) -> str:
         rows = []

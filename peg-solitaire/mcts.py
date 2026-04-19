@@ -74,7 +74,8 @@ class _Node:
         return max(self.children, key=lambda ch: ch.ucb1(c))
 
     def expand(self) -> '_Node':
-        fr, ov, to = self.untried.pop()
+        index = random.randint(0, len(self.untried)-1)
+        fr, ov, to = self.untried.pop(index)
         child_board = self.board.copy()
         child_board.move(fr, to)
         child = _Node(child_board, move=(fr, ov, to), parent=self)
