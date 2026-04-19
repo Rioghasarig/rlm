@@ -1,0 +1,19 @@
+board:
+  n: 5                         # board side length (n×n grid)
+  empty_start: [2, 2]          # starting hole; null → centre (n//2, n//2)
+
+network:
+  res_blocks: 4                # residual blocks in the policy tower
+  filters: 64                  # convolutional filters per block
+
+optimizer:
+  learning_rate: 0.001
+
+dagger:
+  n_iterations: 20             # DAgger outer iterations
+  epochs: 5                    # supervised-learning epochs per iteration
+  batch_size: 64               # mini-batch size for learn()
+  mcts_time_limit: 1.0         # wall-clock seconds given to fast_mcts per state
+  n_trajectories: 2            # policy rollouts collected per iteration
+  save_path: policy_model.keras  # checkpoint path; set to null to disable
+  load_path: null              # resume from this .keras file; null → fresh model
