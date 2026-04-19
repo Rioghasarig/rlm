@@ -1,9 +1,19 @@
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 import math
+import os
 import threading
 from board import Board, TriangularBoard, SquareBoard
 from mcts import mcts as _mcts
+
+try:
+    import keras
+    from policy_network_square import select_action as _nn_select_action
+    _NN_AVAILABLE = True
+except Exception:
+    _NN_AVAILABLE = False
+
+_DEFAULT_MODEL_PATH = "policy_model.keras"
 
 
 class PegSolitaireGUI:
@@ -44,8 +54,10 @@ class PegSolitaireGUI:
         self._history: list[set] = []
         self._suggestion: tuple | None = None
         self._mcts_running = False
+        self._nn_model = None
 
         self._build_ui()
+        self._try_load_model(_DEFAULT_MODEL_PATH)
         self._new_game()
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -86,9 +98,20 @@ class PegSolitaireGUI:
         tk.Button(ctrl, text="Undo",     command=self._undo,     **btn_style).pack(side=tk.LEFT, padx=6)
 
         self._suggest_btn = tk.Button(
-            ctrl, text="Suggest Move", command=self._suggest_move, **btn_style
+            ctrl, text="Suggest (MCTS)", command=self._suggest_move, **btn_style
         )
         self._suggest_btn.pack(side=tk.LEFT, padx=6)
+
+        self._nn_btn = tk.Button(
+            ctrl, text="Suggest (NN)", command=self._suggest_nn,
+            state=tk.DISABLED, **btn_style
+        )
+        self._nn_btn.pack(side=tk.LEFT, padx=6)
+
+        self._load_model_btn = tk.Button(
+            ctrl, text="Load Model…", command=self._load_model_dialog, **btn_style
+        )
+        self._load_model_btn.pack(side=tk.LEFT, padx=6)
 
         self.status_var = tk.StringVar()
         tk.Label(ctrl, textvariable=self.status_var, **lbl_style).pack(side=tk.RIGHT)
@@ -114,6 +137,7 @@ class PegSolitaireGUI:
         self._suggestion = None
         self._draw()
         self._update_status()
+        self._update_nn_btn()
 
     def _undo(self) -> None:
         if not self._history:
@@ -289,6 +313,78 @@ class PegSolitaireGUI:
         self._update_status()
         self._check_game_over()
 
+    # ── neural-network model loading ─────────────────────────────────────────
+
+    def _try_load_model(self, path: str) -> bool:
+        if not _NN_AVAILABLE or not os.path.exists(path):
+            return False
+        try:
+            self._nn_model = keras.models.load_model(path)
+            self._update_nn_btn()
+            return True
+        except Exception:
+            return False
+
+    def _load_model_dialog(self) -> None:
+        if not _NN_AVAILABLE:
+            messagebox.showwarning("Keras not found",
+                                   "Install keras to use neural-network suggestions.")
+            return
+        path = filedialog.askopenfilename(
+            title="Load policy model",
+            filetypes=[("Keras model", "*.keras *.h5"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self._nn_model = keras.models.load_model(path)
+            self._update_nn_btn()
+            messagebox.showinfo("Model loaded", f"Loaded model from:\n{path}")
+        except Exception as exc:
+            messagebox.showerror("Load failed", str(exc))
+
+    def _update_nn_btn(self) -> None:
+        can_use = (
+            _NN_AVAILABLE
+            and self._nn_model is not None
+            and isinstance(self.board, SquareBoard)
+        )
+        self._nn_btn.config(state=tk.NORMAL if can_use else tk.DISABLED)
+
+    # ── NN suggestion ────────────────────────────────────────────────────────
+
+    def _suggest_nn(self) -> None:
+        if not isinstance(self.board, SquareBoard) or self._nn_model is None:
+            return
+        if self._mcts_running or not self.board.available_moves():
+            return
+
+        self._mcts_running = True
+        self._suggestion = None
+        self._nn_btn.config(state=tk.DISABLED, text="Thinking…")
+        self.status_var.set("Neural network running…")
+        self._draw()
+
+        board_snap = self.board.copy()
+        model = self._nn_model
+
+        def _run() -> None:
+            try:
+                move = _nn_select_action(model, board_snap)
+            except Exception:
+                move = None
+            self.root.after(0, lambda: self._on_nn_suggestion(move))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_nn_suggestion(self, move: tuple | None) -> None:
+        self._mcts_running = False
+        self._nn_btn.config(text="Suggest (NN)")
+        self._update_nn_btn()
+        self._suggestion = move
+        self._update_status()
+        self._draw()
+
     # ── MCTS suggestion ──────────────────────────────────────────────────────
 
     def _suggest_move(self) -> None:
@@ -299,7 +395,7 @@ class PegSolitaireGUI:
 
         self._mcts_running = True
         self._suggestion = None
-        self._suggest_btn.config(state=tk.DISABLED, text="Thinking…")
+        self._suggest_btn.config(state=tk.DISABLED, text="Thinking (MCTS)…")
         self.status_var.set("MCTS running…")
         self._draw()
 
@@ -314,7 +410,7 @@ class PegSolitaireGUI:
 
     def _on_suggestion(self, move: tuple | None) -> None:
         self._mcts_running = False
-        self._suggest_btn.config(state=tk.NORMAL, text="Suggest Move")
+        self._suggest_btn.config(state=tk.NORMAL, text="Suggest (MCTS)")
         self._suggestion = move
         self._update_status()
         self._draw()

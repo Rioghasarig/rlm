@@ -72,6 +72,7 @@ def dagger(
     epochs: int,
     batch_size: int,
     mcts_time_limit: float = 1.0,
+    save_path: str | None = "policy_model.keras",
 ) -> keras.Model:
     """DAgger using MCTS as the teacher, for SquareBoard.
 
@@ -82,6 +83,7 @@ def dagger(
     epochs          — learn() epochs per iteration
     batch_size      — learn() batch size
     mcts_time_limit — seconds given to MCTS per state label
+    save_path       — path to save the model after each iteration; None disables saving
 
     Returns the final updated policy.
     """
@@ -101,5 +103,9 @@ def dagger(
 
         print(f"  dataset size: {len(D)}")
         pi = learn(D, pi, optimizer, epochs, batch_size)
+
+        if save_path:
+            pi.save(save_path)
+            print(f"  model saved → {save_path}")
 
     return pi
