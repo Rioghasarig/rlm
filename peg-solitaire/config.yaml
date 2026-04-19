@@ -10,14 +10,14 @@ optimizer:
   learning_rate: 0.001
 
 dagger:
-  n_iterations: 20             # DAgger outer iterations
+  n_iterations: 50             # DAgger outer iterations
   epochs: 5                    # supervised-learning epochs per iteration
   batch_size: 64               # mini-batch size for learn()
-  large_dataset_threshold: null  # dataset size at which to switch to larger epochs/batch; null → never switch
-  large_dataset_epochs: 10     # epochs to use once dataset exceeds threshold
-  large_dataset_batch_size: 128  # batch size to use once dataset exceeds threshold
-  mcts_time_limit: 1.0         # wall-clock seconds given to fast_mcts per state
-  n_trajectories: 2            # policy rollouts collected per iteration
+  large_dataset_threshold: 1500  # dataset size at which to switch to larger epochs/batch; null → never switch
+  large_dataset_epochs: 20     # epochs to use once dataset exceeds threshold
+  large_dataset_batch_size: 256  # batch size to use once dataset exceeds threshold
+  mcts_time_limit: 2.0         # wall-clock seconds given to fast_mcts per state
+  n_trajectories: 5            # policy rollouts collected per iteration
   save_path: policy_model.keras  # checkpoint path; set to null to disable
   load_path: null              # resume from this .keras file; null → fresh model
   n_workers: null              # worker processes for parallel MCTS labeling; null → all CPUs
