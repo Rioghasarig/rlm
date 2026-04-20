@@ -162,7 +162,7 @@ def _gen_trajectory(
     b = board.copy()
     while b.available_moves():
         states.append(b.copy())
-        move = select_action(policy, b)
+        move = select_action(policy, b, greedy=True)
         b.move(move[0], move[2])
     return states, b
 
@@ -176,9 +176,6 @@ def dagger(
     n_iterations: int,
     epochs: int,
     batch_size: int,
-    large_dataset_threshold: int | None = None,
-    large_dataset_epochs: int | None = None,
-    large_dataset_batch_size: int | None = None,
     mcts_time_limit: float = 1.0,
     n_trajectories: int = 1,
     save_path: str | None = "policy_model.keras",
@@ -203,9 +200,6 @@ def dagger(
     n_iterations             — DAgger iterations
     epochs                   — learn() epochs per iteration
     batch_size               — learn() batch size
-    large_dataset_threshold  — dataset size at which to switch to larger epochs/batch; None → never switch
-    large_dataset_epochs     — epochs to use once dataset exceeds threshold
-    large_dataset_batch_size — batch size to use once dataset exceeds threshold
     mcts_time_limit          — wall-clock seconds given to fast_mcts per state
     n_trajectories           — trajectories rolled out per iteration (default 1)
     save_path                — save model after each iteration; None disables saving
@@ -327,16 +321,8 @@ def dagger(
 
             print(f"\n  dataset: {len(D)} total  (+{new_samples} this iteration)")
             print(f"  --- training ---")
-            use_large = (
-                large_dataset_threshold is not None
-                and len(D) >= large_dataset_threshold
-            )
-            eff_epochs = (large_dataset_epochs or epochs) if use_large else epochs
-            eff_batch  = (large_dataset_batch_size or batch_size) if use_large else batch_size
-            if use_large:
-                print(f"  (large-dataset regime: epochs={eff_epochs}, batch_size={eff_batch})")
             train_start = time.perf_counter()
-            pi = learn(D, pi, optimizer, eff_epochs, eff_batch, record_fn=record, iteration=i + 1)
+            pi = learn(D, pi, optimizer, epochs, batch_size, record_fn=record, iteration=i + 1)
             train_time = time.perf_counter() - train_start
 
             if save_path:
@@ -424,9 +410,6 @@ def main(config_path: str = "config.yaml") -> None:
         n_iterations=dc["n_iterations"],
         epochs=dc["epochs"],
         batch_size=dc["batch_size"],
-        large_dataset_threshold=dc.get("large_dataset_threshold"),
-        large_dataset_epochs=dc.get("large_dataset_epochs"),
-        large_dataset_batch_size=dc.get("large_dataset_batch_size"),
         mcts_time_limit=dc["mcts_time_limit"],
         n_trajectories=dc.get("n_trajectories", 1),
         save_path=dc.get("save_path"),

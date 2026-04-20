@@ -11,11 +11,8 @@ optimizer:
 
 dagger:
   n_iterations: 50             # DAgger outer iterations
-  epochs: 5                    # supervised-learning epochs per iteration
-  batch_size: 64               # mini-batch size for learn()
-  large_dataset_threshold: 200  # dataset size at which to switch to larger epochs/batch; null → never switch
-  large_dataset_epochs: 20     # epochs to use once dataset exceeds threshold
-  large_dataset_batch_size: 256  # batch size to use once dataset exceeds threshold
+  epochs: 20                   # supervised-learning epochs per iteration
+  batch_size: 256              # mini-batch size for learn()
   mcts_time_limit: 2.0         # wall-clock seconds given to fast_mcts per state
   n_trajectories: 5            # policy rollouts collected per iteration
   save_path: policy_model.keras  # checkpoint path; set to null to disable

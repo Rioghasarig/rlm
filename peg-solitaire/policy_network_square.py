@@ -47,8 +47,12 @@ def encode_board(board: SquareBoard) -> np.ndarray:
     return board.encode()[np.newaxis, ..., np.newaxis]
 
 
-def select_action(model: keras.Model, board: SquareBoard) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
-    """Sample a legal move using the probabilities given by the policy model."""
+def select_action(model: keras.Model, board: SquareBoard, greedy: bool = False) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    """Select a legal move using the policy model.
+
+    greedy=True  → pick the move with highest probability (argmax).
+    greedy=False → sample from the softmax distribution over legal moves.
+    """
     legal_moves = board.available_moves()
     if not legal_moves:
         raise ValueError("No legal moves available")
@@ -58,8 +62,12 @@ def select_action(model: keras.Model, board: SquareBoard) -> tuple[tuple[int, in
     legal_codes = [board.encode_move(m) for m in legal_moves]
     legal_logits = logits[legal_codes]
     legal_logits -= legal_logits.max()  # numerical stability
-    probs = np.exp(legal_logits)
-    probs /= probs.sum()
 
-    idx = np.random.choice(len(legal_moves), p=probs)
+    if greedy:
+        idx = int(np.argmax(legal_logits))
+    else:
+        probs = np.exp(legal_logits)
+        probs /= probs.sum()
+        idx = np.random.choice(len(legal_moves), p=probs)
+
     return legal_moves[idx]
