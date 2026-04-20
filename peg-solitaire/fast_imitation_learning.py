@@ -162,12 +162,94 @@ def _gen_trajectory(
     b = board.copy()
     while b.available_moves():
         states.append(b.copy())
-        move = select_action(policy, b, greedy=True)
+        move = select_action(policy, b, greedy=False)
         b.move(move[0], move[2])
     return states, b
 
 
 # ── DAgger ────────────────────────────────────────────────────────────────────
+
+def _collect_trajectories(
+    pi: keras.Model,
+    initial_board: SquareBoard,
+    n_trajectories: int,
+    pool,
+    n_workers: int,
+    record_fn=None,
+    iteration: int | None = None,
+) -> list[tuple[np.ndarray, int]]:
+    """Generate n_trajectories rollouts, label every state with MCTS, return samples."""
+    samples: list[tuple[np.ndarray, int]] = []
+    new_samples = 0
+
+    for t in range(n_trajectories):
+        traj_start = time.perf_counter()
+        trajectory, final_board = _gen_trajectory(pi, initial_board)
+        traj_time = time.perf_counter() - traj_start
+        pegs_left = int(final_board.encode().sum())
+
+        traj_label = f"trajectory {t + 1}/{n_trajectories}" if n_trajectories > 1 else "trajectory"
+        print(f"\n  [{traj_label}]  {len(trajectory)} steps, "
+              f"{pegs_left} peg(s) remaining  ({traj_time:.2f}s)")
+        if record_fn is not None:
+            record_fn(
+                type="trajectory",
+                iteration=iteration,
+                trajectory_idx=t,
+                steps=len(trajectory),
+                pegs_remaining=pegs_left,
+                traj_time_s=round(traj_time, 3),
+            )
+
+        n_states = len(trajectory)
+        label_start = time.perf_counter()
+        raw_results: list[tuple[int, tuple | None]] = []
+
+        for done, (idx, move) in enumerate(
+            pool.imap_unordered(_mcts_label_one, enumerate(trajectory)),
+            start=1,
+        ):
+            raw_results.append((idx, move))
+            pct = done / n_states * 100
+            elapsed_label = time.perf_counter() - label_start
+            rate = done / elapsed_label if elapsed_label > 0 else 0
+            sys.stdout.write(
+                f"\r  labeling: {done:>{len(str(n_states))}}/{n_states} "
+                f"({pct:5.1f}%)  {rate:.1f} states/s  "
+                f"workers={n_workers}     "
+            )
+            sys.stdout.flush()
+
+        label_time = time.perf_counter() - label_start
+        sys.stdout.write("\n")
+
+        labeled = 0
+        skipped = 0
+        for idx, move in raw_results:
+            if move is None:
+                skipped += 1
+                continue
+            state = trajectory[idx]
+            samples.append((state.encode(), state.encode_move(move)))
+            labeled += 1
+            new_samples += 1
+
+        print(f"  labeled {labeled}/{n_states} states  "
+              f"(skipped {skipped})  in {label_time:.1f}s  "
+              f"avg {label_time/n_states:.2f}s/state")
+        if record_fn is not None:
+            record_fn(
+                type="labeling",
+                iteration=iteration,
+                trajectory_idx=t,
+                labeled=labeled,
+                skipped=skipped,
+                label_time_s=round(label_time, 3),
+                rate_states_per_s=round(labeled / label_time if label_time > 0 else 0, 2),
+            )
+
+    return samples
+
 
 def dagger(
     pi0: keras.Model,
@@ -178,21 +260,13 @@ def dagger(
     batch_size: int,
     mcts_time_limit: float = 1.0,
     n_trajectories: int = 1,
+    n_initial_trajectories: int = 0,
+    max_dataset_size: int | None = None,
     save_path: str | None = "policy_model.keras",
     n_workers: int | None = None,
     log_path: str | None = None,
 ) -> keras.Model:
     """DAgger using fast_mcts as the teacher, for SquareBoard.
-
-    Differences from imitation_learning.dagger():
-      - fast_mcts (JAX lax.scan rollouts, flat-array tree) labels each state.
-      - MCTS labeling is parallelized across n_workers processes (default:
-        os.cpu_count()).  Each worker warms up the JAX XLA kernel once in its
-        initializer; the pool is reused across all DAgger iterations.
-      - Training uses jit_compile=True compiled once before iteration 1 and
-        reused on every subsequent learn() call without retracing.
-      - n_trajectories trajectories are rolled out per iteration, diversifying
-        the dataset with the current policy before MCTS labelling.
 
     pi0                      — initial policy from build_square_policy_network
     initial_board            — starting board for every trajectory
@@ -202,6 +276,8 @@ def dagger(
     batch_size               — learn() batch size
     mcts_time_limit          — wall-clock seconds given to fast_mcts per state
     n_trajectories           — trajectories rolled out per iteration (default 1)
+    n_initial_trajectories   — trajectories collected before iteration 1 to seed the dataset
+    max_dataset_size         — cap on dataset length; oldest samples are evicted first; None → unlimited
     save_path                — save model after each iteration; None disables saving
     n_workers                — worker processes for parallel MCTS labeling (default: all CPUs)
 
@@ -215,6 +291,11 @@ def dagger(
 
     D: list[tuple[np.ndarray, int]] = []
     pi = pi0
+
+    def _append_samples(dataset: list, new: list) -> None:
+        dataset.extend(new)
+        if max_dataset_size is not None and len(dataset) > max_dataset_size:
+            del dataset[:len(dataset) - max_dataset_size]
     run_start = time.perf_counter()
 
     def record(**fields):
@@ -224,6 +305,7 @@ def dagger(
         type="run_start",
         n_iterations=n_iterations,
         n_trajectories=n_trajectories,
+        n_initial_trajectories=n_initial_trajectories,
         epochs=epochs,
         batch_size=batch_size,
         mcts_time_limit=mcts_time_limit,
@@ -243,6 +325,18 @@ def dagger(
     ) as pool:
         print("Workers ready.")
 
+        if n_initial_trajectories > 0:
+            print(f"\n{'='*60}")
+            print(f"Pre-DAgger data collection: {n_initial_trajectories} initial trajectory/trajectories")
+            print(f"{'='*60}")
+            initial_samples = _collect_trajectories(
+                pi, initial_board, n_initial_trajectories, pool, n_workers,
+                record_fn=record, iteration=0,
+            )
+            _append_samples(D, initial_samples)
+            print(f"\n  collected {len(initial_samples)} initial samples  (dataset now {len(D)})")
+            record(type="initial_collection_end", dataset_size=len(D))
+
         for i in range(n_iterations):
             iter_start = time.perf_counter()
             elapsed_total = iter_start - run_start
@@ -252,74 +346,13 @@ def dagger(
             print(f"{'='*60}")
             record(type="iteration_start", iteration=i + 1, dataset_size=len(D))
 
-            new_samples = 0
+            new_samples_list = _collect_trajectories(
+                pi, initial_board, n_trajectories, pool, n_workers,
+                record_fn=record, iteration=i + 1,
+            )
+            _append_samples(D, new_samples_list)
 
-            for t in range(n_trajectories):
-                traj_start = time.perf_counter()
-                trajectory, final_board = _gen_trajectory(pi, initial_board)
-                traj_time = time.perf_counter() - traj_start
-                pegs_left = int(final_board.encode().sum())
-
-                traj_label = f"trajectory {t + 1}/{n_trajectories}" if n_trajectories > 1 else "trajectory"
-                print(f"\n  [{traj_label}]  {len(trajectory)} steps, "
-                      f"{pegs_left} peg(s) remaining  ({traj_time:.2f}s)")
-                record(
-                    type="trajectory",
-                    iteration=i + 1,
-                    trajectory_idx=t,
-                    steps=len(trajectory),
-                    pegs_remaining=pegs_left,
-                    traj_time_s=round(traj_time, 3),
-                )
-
-                # Parallel MCTS labeling — each state is independent.
-                n_states    = len(trajectory)
-                label_start = time.perf_counter()
-                raw_results: list[tuple[int, tuple | None]] = []
-
-                for done, (idx, move) in enumerate(
-                    pool.imap_unordered(_mcts_label_one, enumerate(trajectory)),
-                    start=1,
-                ):
-                    raw_results.append((idx, move))
-                    pct  = done / n_states * 100
-                    elapsed_label = time.perf_counter() - label_start
-                    rate = done / elapsed_label if elapsed_label > 0 else 0
-                    sys.stdout.write(
-                        f"\r  labeling: {done:>{len(str(n_states))}}/{n_states} "
-                        f"({pct:5.1f}%)  {rate:.1f} states/s  "
-                        f"workers={n_workers}     "
-                    )
-                    sys.stdout.flush()
-
-                label_time = time.perf_counter() - label_start
-                sys.stdout.write("\n")
-
-                labeled = 0
-                skipped = 0
-                for idx, move in raw_results:
-                    if move is None:
-                        skipped += 1
-                        continue
-                    state = trajectory[idx]
-                    D.append((state.encode(), state.encode_move(move)))
-                    labeled += 1
-                    new_samples += 1
-
-                print(f"  labeled {labeled}/{n_states} states  "
-                      f"(skipped {skipped})  in {label_time:.1f}s  "
-                      f"avg {label_time/n_states:.2f}s/state")
-                record(
-                    type="labeling",
-                    iteration=i + 1,
-                    trajectory_idx=t,
-                    labeled=labeled,
-                    skipped=skipped,
-                    label_time_s=round(label_time, 3),
-                    rate_states_per_s=round(labeled / label_time if label_time > 0 else 0, 2),
-                )
-
-            print(f"\n  dataset: {len(D)} total  (+{new_samples} this iteration)")
+            print(f"\n  dataset: {len(D)} total  (+{len(new_samples_list)} this iteration)")
             print(f"  --- training ---")
             train_start = time.perf_counter()
             pi = learn(D, pi, optimizer, epochs, batch_size, record_fn=record, iteration=i + 1)
@@ -335,7 +368,7 @@ def dagger(
                 type="iteration_end",
                 iteration=i + 1,
                 dataset_size=len(D),
-                new_samples=new_samples,
+                new_samples=len(new_samples_list),
                 train_time_s=round(train_time, 3),
                 iter_time_s=round(iter_time, 3),
             )
@@ -412,6 +445,8 @@ def main(config_path: str = "config.yaml") -> None:
         batch_size=dc["batch_size"],
         mcts_time_limit=dc["mcts_time_limit"],
         n_trajectories=dc.get("n_trajectories", 1),
+        n_initial_trajectories=dc.get("n_initial_trajectories", 0),
+        max_dataset_size=dc.get("max_dataset_size"),
         save_path=dc.get("save_path"),
         n_workers=dc.get("n_workers"),
         log_path=log_path,
