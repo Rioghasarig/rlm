@@ -181,14 +181,17 @@ def fast_mcts(
     board: SquareBoard,
     time_limit: float = 2.0,
     exploration: float = 1.41,
+    reward_mode: str = "binary_win",
 ) -> tuple | None:
     """
     JAX-accelerated MCTS from *board* for up to *time_limit* seconds.
 
     Args:
-        board:       SquareBoard to search (not mutated).
-        time_limit:  Wall-clock seconds to search.
-        exploration: UCB1 constant (default √2 ≈ 1.41).
+        board:        SquareBoard to search (not mutated).
+        time_limit:   Wall-clock seconds to search.
+        exploration:  UCB1 constant (default √2 ≈ 1.41).
+        reward_mode:  "binary_win"   — reward = 1 if 1 peg remains, else 0 (default);
+                      "pegs_removed" — reward = fraction of pegs removed.
 
     Returns:
         Best (from_pos, over_pos, to_pos) triple, or None if no moves exist.
@@ -238,7 +241,10 @@ def fast_mcts(
         # 3. Simulation — one compiled JAX rollout
         key, sub  = jax.random.split(key)
         remaining = int(_run_rollout(jnp.asarray(tree.boards[node]), sub, move_table_jax, max_steps))
-        reward    = (initial_count - remaining) / max(initial_count - 1, 1)
+        if reward_mode == "binary_win":
+            reward = 1.0 if remaining == 1 else 0.0
+        else:
+            reward = (initial_count - remaining) / max(initial_count - 1, 1)
 
         # 4. Backpropagation — two NumPy scatter-adds along the recorded path
         tree.backpropagate(path, float(reward))

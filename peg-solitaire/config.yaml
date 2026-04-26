@@ -21,3 +21,4 @@ dagger:
   load_path: policy_model.keras  # resume from this .keras file; null → fresh model
   n_workers: null              # worker processes for parallel MCTS labeling; null → all CPUs
   log_dir: runs                # directory for JSONL progress logs; null → no log written
+  reward_mode: binary_win      # rollout reward: "binary_win" (1 if 1 peg remains, else 0) or "pegs_removed" (fraction removed)

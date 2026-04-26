@@ -55,17 +55,19 @@ def _record(log_path: str | None, run_start: float, **fields) -> None:
 # JAX XLA kernel once in its initializer so timed MCTS calls pay no compile cost.
 
 _worker_time_limit: float = 1.0
+_worker_reward_mode: str = "binary_win"
 
 
-def _mcts_worker_init(n: int, time_limit: float) -> None:
-    global _worker_time_limit
+def _mcts_worker_init(n: int, time_limit: float, reward_mode: str) -> None:
+    global _worker_time_limit, _worker_reward_mode
     _worker_time_limit = time_limit
+    _worker_reward_mode = reward_mode
     warmup_jax_kernel(SquareBoard(n))
 
 
 def _mcts_label_one(args: tuple) -> tuple[int, tuple | None]:
     idx, board = args
-    return idx, fast_mcts(board, time_limit=_worker_time_limit)
+    return idx, fast_mcts(board, time_limit=_worker_time_limit, reward_mode=_worker_reward_mode)
 
 
 # ── JAX warm-up ───────────────────────────────────────────────────────────────
@@ -265,6 +267,7 @@ def dagger(
     save_path: str | None = "policy_model.keras",
     n_workers: int | None = None,
     log_path: str | None = None,
+    reward_mode: str = "binary_win",
 ) -> keras.Model:
     """DAgger using fast_mcts as the teacher, for SquareBoard.
 
@@ -280,6 +283,7 @@ def dagger(
     max_dataset_size         — cap on dataset length; oldest samples are evicted first; None → unlimited
     save_path                — save model after each iteration; None disables saving
     n_workers                — worker processes for parallel MCTS labeling (default: all CPUs)
+    reward_mode              — "binary_win" (1 if 1 peg remains, else 0) or "pegs_removed" (fraction removed)
 
     Returns the final updated policy.
     """
@@ -321,7 +325,7 @@ def dagger(
     with ctx.Pool(
         processes=n_workers,
         initializer=_mcts_worker_init,
-        initargs=(initial_board.n, mcts_time_limit),
+        initargs=(initial_board.n, mcts_time_limit, reward_mode),
     ) as pool:
         print("Workers ready.")
 
@@ -450,6 +454,7 @@ def main(config_path: str = "config.yaml") -> None:
         save_path=dc.get("save_path"),
         n_workers=dc.get("n_workers"),
         log_path=log_path,
+        reward_mode=dc.get("reward_mode", "binary_win"),
     )
 
 

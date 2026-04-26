@@ -2,10 +2,9 @@ import argparse
 import pandas as pd
 import matplotlib.pyplot as plt
 
-JSONL = "runs/20260419_081743_n10.jsonl"
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--jsonl", default=JSONL)
+parser.add_argument("--jsonl")
 parser.add_argument("--plot", choices=["loss", "pegs", "both"], default="loss",
                     help="Which metric to plot (default: loss)")
 args = parser.parse_args()
@@ -32,8 +31,9 @@ def plot_loss(ax):
         ax.axvline(ep, color="gray", linewidth=0.5, linestyle="--", alpha=0.6)
         ax.text(ep + 0.1, ax.get_ylim()[1], f"iter {it}", fontsize=6, color="gray", va="top")
 
+    ax.set_yscale("log")
     ax.set_xlabel("Global epoch")
-    ax.set_ylabel("Loss")
+    ax.set_ylabel("Loss (log scale)")
     ax.set_title("Epoch loss")
     ax.grid(True, alpha=0.3)
 
