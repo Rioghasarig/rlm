@@ -1,0 +1,24 @@
+board:
+  n: 6                         # board side length (n×n grid)
+  empty_start: null            # starting hole; null → centre (n//2, n//2)
+
+network:
+  res_blocks: 2                # residual blocks in the policy tower
+  filters: 32                  # convolutional filters per block
+
+optimizer:
+  learning_rate: 0.0003
+
+dagger:
+  n_iterations: 50             # DAgger outer iterations
+  epochs: 10                   # supervised-learning epochs per iteration
+  batch_size: 128              # mini-batch size for learn()
+  dfs_max_depth: 5             # look-ahead depth for fast_dfs
+  dfs_q: 3                     # quiescence threshold: extend search when moves ≤ q
+  n_trajectories: 5            # policy rollouts collected per iteration
+  n_initial_trajectories: 20  # trajectories collected before iteration 1 to seed the dataset; 0 → skip
+  max_dataset_size: 5000      # oldest samples evicted when exceeded; null → unlimited
+  save_path: policy_model_dfs.keras  # checkpoint path; set to null to disable
+  load_path: null              # resume from this .keras file; null → fresh model
+  n_workers: null              # worker processes for fast_dfs root-move parallelism; null → all CPUs
+  log_dir: runs                # directory for JSONL progress logs; null → no log written
