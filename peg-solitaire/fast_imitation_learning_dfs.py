@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -110,40 +111,122 @@ def _gen_trajectory(
     return states, b
 
 
+# ── Initial-board set construction ─────────────────────────────────────────────
+
+def _random_descendant(parent: SquareBoard, n_moves: int, rng: random.Random):
+    """Play n_moves random legal moves from parent.
+
+    Returns the resulting board, or None if it dead-ends (no legal moves) before
+    n_moves have been played.
+    """
+    b = parent.copy()
+    for _ in range(n_moves):
+        moves = b.available_moves()
+        if not moves:
+            return None
+        mv = rng.choice(moves)
+        b.move(mv[0], mv[2])
+    return b
+
+
+def build_initial_boards(
+    base_board: SquareBoard,
+    *,
+    branching: int = 5,
+    moves_per_step: int = 5,
+    depth: int = 2,
+    seed: int | None = None,
+    max_tries_per_child: int = 200,
+) -> list[SquareBoard]:
+    """Build a set of starting boards by repeated random descent from base_board.
+
+    Level 0 is base_board itself. Every board at level d is expanded into
+    `branching` children, each child reached by playing `moves_per_step` random
+    legal moves from that parent. The construction runs for `depth` levels.
+
+    All boards produced are de-duplicated by peg configuration, so no two starts
+    in the returned set are identical (this is what guarantees "no repeats" both
+    among siblings and across all boards generated at a given level). Because
+    every board at a level has the same peg count (base − level·moves_per_step),
+    a single global `seen` set is enough — boards from different levels can never
+    collide.
+
+    Returns base_board plus every descendant: 1 + Σ_{d=1..depth} branching^d boards.
+    With the defaults (branching=5, depth=2) that is 1 + 5 + 25 = 31 boards.
+    """
+    rng = random.Random(seed)
+    seen: set[frozenset] = {frozenset(base_board.pegs)}
+    all_boards: list[SquareBoard] = [base_board.copy()]
+    frontier: list[SquareBoard] = [base_board]
+
+    for level in range(depth):
+        next_frontier: list[SquareBoard] = []
+        for parent in frontier:
+            produced = 0
+            tries = 0
+            while produced < branching:
+                if tries >= max_tries_per_child * branching:
+                    raise RuntimeError(
+                        f"build_initial_boards: only generated {produced}/{branching} "
+                        f"unique descendants at level {level + 1} after {tries} tries. "
+                        f"Reduce branching/moves_per_step/depth or use a larger board."
+                    )
+                tries += 1
+                child = _random_descendant(parent, moves_per_step, rng)
+                if child is None:
+                    continue  # dead-ended before moves_per_step moves
+                key = frozenset(child.pegs)
+                if key in seen:
+                    continue  # duplicate position — try again
+                seen.add(key)
+                next_frontier.append(child)
+                all_boards.append(child)
+                produced += 1
+        frontier = next_frontier
+
+    return all_boards
+
+
 # ── DAgger ────────────────────────────────────────────────────────────────────
 
 def _collect_trajectories(
     pi: keras.Model,
-    initial_board: SquareBoard,
+    initial_boards: list[SquareBoard],
     n_trajectories: int,
     dfs_max_depth: int,
     dfs_q: int,
     dfs_max_breadth: int | None,
     n_workers: int,
+    rng: random.Random,
     record_fn=None,
     iteration: int | None = None,
 ) -> list[tuple[np.ndarray, int]]:
     """Generate n_trajectories rollouts, label every state with fast_dfs, return samples.
 
-    fast_dfs is single-threaded; the states within a trajectory are labeled
-    concurrently using a pool of n_workers threads.
+    Each rollout starts from a board sampled uniformly at random from
+    initial_boards (the set built by build_initial_boards). fast_dfs is
+    single-threaded; the states within a trajectory are labeled concurrently
+    using a pool of n_workers threads.
     """
     samples: list[tuple[np.ndarray, int]] = []
 
     for t in range(n_trajectories):
+        start_board = rng.choice(initial_boards)
+        start_pegs = len(start_board.pegs)
         traj_start = time.perf_counter()
-        trajectory, final_board = _gen_trajectory(pi, initial_board)
+        trajectory, final_board = _gen_trajectory(pi, start_board)
         traj_time = time.perf_counter() - traj_start
         pegs_left = int(final_board.encode()[..., 0].sum())
 
         traj_label = f"trajectory {t + 1}/{n_trajectories}" if n_trajectories > 1 else "trajectory"
-        print(f"\n  [{traj_label}]  {len(trajectory)} steps, "
+        print(f"\n  [{traj_label}]  start {start_pegs} pegs, {len(trajectory)} steps, "
               f"{pegs_left} peg(s) remaining  ({traj_time:.2f}s)")
         if record_fn is not None:
             record_fn(
                 type="trajectory",
                 iteration=iteration,
                 trajectory_idx=t,
+                start_pegs=start_pegs,
                 steps=len(trajectory),
                 pegs_remaining=pegs_left,
                 traj_time_s=round(traj_time, 3),
@@ -200,7 +283,7 @@ def _collect_trajectories(
 
 def dagger(
     pi0: keras.Model,
-    initial_board: SquareBoard,
+    initial_boards: list[SquareBoard],
     optimizer: keras.optimizers.Optimizer,
     n_iterations: int,
     epochs: int,
@@ -214,11 +297,13 @@ def dagger(
     save_path: str | None = "policy_model.keras",
     n_workers: int | None = None,
     log_path: str | None = None,
+    sample_seed: int | None = None,
 ) -> keras.Model:
     """DAgger using fast_dfs as the teacher, for SquareBoard.
 
     pi0                      — initial policy from build_square_policy_network
-    initial_board            — starting board for every trajectory
+    initial_boards           — set of starting boards; each rollout samples one
+                               uniformly at random (see build_initial_boards)
     optimizer                — e.g. keras.optimizers.Adam(1e-3)
     n_iterations             — DAgger iterations
     epochs                   — learn() epochs per iteration
@@ -232,10 +317,12 @@ def dagger(
     save_path                — save model after each iteration; None disables saving
     n_workers                — number of threads for concurrent state labeling
     log_path                 — JSONL file for progress logging; None disables logging
+    sample_seed              — seed for per-trajectory start-board sampling; None → nondeterministic
 
     Returns the final updated policy.
     """
     n_workers = n_workers or (os.cpu_count() or 1)
+    sample_rng = random.Random(sample_seed)
 
     _ensure_jit_compiled(pi0, optimizer)
 
@@ -263,7 +350,8 @@ def dagger(
         dfs_q=dfs_q,
         dfs_max_breadth=dfs_max_breadth,
         n_workers=n_workers,
-        board_n=initial_board.n,
+        board_n=initial_boards[0].n,
+        n_initial_boards=len(initial_boards),
         dataset_size=0,
     )
 
@@ -275,8 +363,8 @@ def dagger(
         print(f"Pre-DAgger data collection: {n_initial_trajectories} initial trajectory/trajectories")
         print(f"{'='*60}")
         initial_samples = _collect_trajectories(
-            pi, initial_board, n_initial_trajectories,
-            dfs_max_depth, dfs_q, dfs_max_breadth, n_workers,
+            pi, initial_boards, n_initial_trajectories,
+            dfs_max_depth, dfs_q, dfs_max_breadth, n_workers, sample_rng,
             record_fn=record, iteration=0,
         )
         _append_samples(D, initial_samples)
@@ -293,8 +381,8 @@ def dagger(
         record(type="iteration_start", iteration=i + 1, dataset_size=len(D))
 
         new_samples_list = _collect_trajectories(
-            pi, initial_board, n_trajectories,
-            dfs_max_depth, dfs_q, dfs_max_breadth, n_workers,
+            pi, initial_boards, n_trajectories,
+            dfs_max_depth, dfs_q, dfs_max_breadth, n_workers, sample_rng,
             record_fn=record, iteration=i + 1,
         )
         _append_samples(D, new_samples_list)
@@ -362,6 +450,20 @@ def main(config_path: str = "config_dfs.yaml") -> None:
         raise ValueError(f"Unknown board type {board_type!r}; expected 'square' or 'cross'")
     n = board.n
 
+    # Initial-board set: the standard board plus random-descent descendants.
+    isc = bc.get("init_set") or {}
+    initial_boards = build_initial_boards(
+        board,
+        branching=isc.get("branching", 5),
+        moves_per_step=isc.get("moves_per_step", 5),
+        depth=isc.get("depth", 2),
+        seed=isc.get("seed"),
+    )
+    print(f"Initial-board set: {len(initial_boards)} boards "
+          f"(branching={isc.get('branching', 5)}, "
+          f"moves_per_step={isc.get('moves_per_step', 5)}, "
+          f"depth={isc.get('depth', 2)})")
+
     # Network
     nc  = cfg["network"]
     if cfg["dagger"].get("load_path"):
@@ -393,7 +495,7 @@ def main(config_path: str = "config_dfs.yaml") -> None:
 
     dagger(
         pi0=pi0,
-        initial_board=board,
+        initial_boards=initial_boards,
         optimizer=optimizer,
         n_iterations=dc["n_iterations"],
         epochs=dc["epochs"],
@@ -407,6 +509,7 @@ def main(config_path: str = "config_dfs.yaml") -> None:
         save_path=dc.get("save_path"),
         n_workers=dc.get("n_workers"),
         log_path=log_path,
+        sample_seed=isc.get("sample_seed"),
     )
 
 

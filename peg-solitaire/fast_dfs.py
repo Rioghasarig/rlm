@@ -4,12 +4,10 @@ Optimized depth-first search for peg solitaire.
 Optimizations over dfs.py:
   1. JAX JIT-compiled move generation  — eliminates Python-loop overhead on
                                          the hot inner loop
-  2. Transposition table               — skips re-evaluating repeated states;
-                                         shared across root moves
-  3. In-place numpy mutation (apply/undo) — avoids array copies
-  4. Move ordering                     — most-open moves first so the win
+  2. In-place numpy mutation (apply/undo) — avoids array copies
+  3. Move ordering                     — most-open moves first so the win
                                          cutoff fires sooner
-  5. Quiescence search                 — extends past the depth limit in
+  4. Quiescence search                 — extends past the depth limit in
                                          narrow positions (moves <= q)
 
 This module is single-threaded. Parallelism, when wanted, is the caller's
@@ -113,33 +111,40 @@ def _order_moves(arr, frs, ovs, tos, moves) -> list:
     return [(fr, ov, to) for _, fr, ov, to in scored]
 
 
+def _limit_breadth(moves, max_breadth) -> list:
+    """Keep at most *max_breadth* moves, discarding the rest.
+
+    Assumes *moves* is already sorted most-open first, so this keeps the moves
+    with the most successors.
+    """
+    if max_breadth is None or len(moves) <= max_breadth:
+        return moves
+    return moves[:max_breadth]
+
+
 # ── recursive DFS ─────────────────────────────────────────────────────────────
 
-def _dfs(arr, frs, ovs, tos, depth: int, q: int, table: dict) -> int:
+def _dfs(arr, frs, ovs, tos, depth: int, q: int, max_breadth) -> int:
     moves = _get_moves(arr, frs, ovs, tos)
     if not moves:
         return int(arr.sum())
     if depth == 0 and len(moves) > q:
         return int(arr.sum())
 
-    key = (arr.tobytes(), depth)
-    cached = table.get(key)
-    if cached is not None:
-        return cached
-
     next_depth = depth - 1 if depth > 0 else 0
     best = int(arr.sum())
 
-    for fr, ov, to in _order_moves(arr, frs, ovs, tos, moves):
+    moves = _order_moves(arr, frs, ovs, tos, moves)
+    moves = _limit_breadth(moves, max_breadth)
+    for fr, ov, to in moves:
         _apply(arr, fr, ov, to)
-        result = _dfs(arr, frs, ovs, tos, next_depth, q, table)
+        result = _dfs(arr, frs, ovs, tos, next_depth, q, max_breadth)
         _undo(arr, fr, ov, to)
         if result < best:
             best = result
             if best == 1:
                 break
 
-    table[key] = best
     return best
 
 
@@ -149,25 +154,32 @@ def fast_dfs(
     board: Board,
     max_depth: int,
     q: int = 1,
+    max_breadth: int | None = None,
 ) -> tuple | None:
     """
     Search *board* to *max_depth* plies and return the move that minimises
     the number of pegs remaining.
 
-    Single-threaded: root moves are evaluated sequentially, sharing one
-    transposition table. The win cutoff (1 peg) short-circuits the search.
+    Single-threaded: root moves are evaluated sequentially. The win cutoff
+    (1 peg) short-circuits the search.
 
     Args:
-        board:     Board to search from (not mutated).
-        max_depth: Maximum number of moves to look ahead.
-        q:         Quiescence threshold — at the depth limit, keep searching
-                   if available moves <= q (default 1).
+        board:       Board to search from (not mutated).
+        max_depth:   Maximum number of moves to look ahead.
+        q:           Quiescence threshold — at the depth limit, keep searching
+                     if available moves <= q (default 1).
+        max_breadth: Maximum number of children to expand per node. When a
+                     node has more than *max_breadth* legal moves, the
+                     *max_breadth* moves with the most successors are kept and
+                     the rest are discarded. None (default) expands every child.
 
     Returns:
         Best (from_pos, over_pos, to_pos) triple, or None if no moves exist.
     """
     if max_depth < 1:
         raise ValueError("max_depth must be at least 1")
+    if max_breadth is not None and max_breadth < 1:
+        raise ValueError("max_breadth must be at least 1")
 
     arr = _to_array(board)
     frs, ovs, tos = _build_candidates(board)
@@ -180,13 +192,13 @@ def fast_dfs(
         return None
 
     moves = _order_moves(arr, frs, ovs, tos, moves)
+    moves = _limit_breadth(moves, max_breadth)
 
-    table: dict = {}
     best_score = int(arr.sum()) + 1
     best_move = None
     for fr, ov, to in moves:
         _apply(arr, fr, ov, to)
-        score = _dfs(arr, frs, ovs, tos, max_depth - 1, q, table)
+        score = _dfs(arr, frs, ovs, tos, max_depth - 1, q, max_breadth)
         _undo(arr, fr, ov, to)
         if score < best_score:
             best_score = score
