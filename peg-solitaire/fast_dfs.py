@@ -4,22 +4,22 @@ Optimized depth-first search for peg solitaire.
 Optimizations over dfs.py:
   1. JAX JIT-compiled move generation  — eliminates Python-loop overhead on
                                          the hot inner loop
-  2. Multiprocessing                   — root moves evaluated in parallel
-                                         across CPU cores
-  3. Transposition table per worker    — skips re-evaluating repeated states
-  4. In-place numpy mutation (apply/undo) — avoids array copies
-  5. Move ordering                     — most-open moves first so the win
+  2. Transposition table               — skips re-evaluating repeated states;
+                                         shared across root moves
+  3. In-place numpy mutation (apply/undo) — avoids array copies
+  4. Move ordering                     — most-open moves first so the win
                                          cutoff fires sooner
-  6. Quiescence search                 — extends past the depth limit in
+  5. Quiescence search                 — extends past the depth limit in
                                          narrow positions (moves <= q)
+
+This module is single-threaded. Parallelism, when wanted, is the caller's
+responsibility (e.g. labeling many states concurrently with a thread pool).
 
 Public API
 ----------
-fast_dfs(board, max_depth, q, n_workers) -> (from_pos, over_pos, to_pos) | None
+fast_dfs(board, max_depth, q) -> (from_pos, over_pos, to_pos) | None
 """
 from __future__ import annotations
-
-import multiprocessing
 
 import jax
 import jax.numpy as jnp
@@ -143,35 +143,25 @@ def _dfs(arr, frs, ovs, tos, depth: int, q: int, table: dict) -> int:
     return best
 
 
-# ── multiprocessing worker ────────────────────────────────────────────────────
-
-def _worker(args: tuple) -> tuple[int, tuple]:
-    arr, frs, ovs, tos, fr, ov, to, depth, q = args
-    arr = arr.copy()
-    _apply(arr, fr, ov, to)
-    score = _dfs(arr, frs, ovs, tos, depth, q, {})
-    return score, (fr, ov, to)
-
-
 # ── public entry point ────────────────────────────────────────────────────────
 
 def fast_dfs(
     board: Board,
     max_depth: int,
     q: int = 1,
-    n_workers: int | None = None,
 ) -> tuple | None:
     """
     Search *board* to *max_depth* plies and return the move that minimises
     the number of pegs remaining.
+
+    Single-threaded: root moves are evaluated sequentially, sharing one
+    transposition table. The win cutoff (1 peg) short-circuits the search.
 
     Args:
         board:     Board to search from (not mutated).
         max_depth: Maximum number of moves to look ahead.
         q:         Quiescence threshold — at the depth limit, keep searching
                    if available moves <= q (default 1).
-        n_workers: Worker processes for root-move parallelism
-                   (default: os.cpu_count()).
 
     Returns:
         Best (from_pos, over_pos, to_pos) triple, or None if no moves exist.
@@ -182,7 +172,7 @@ def fast_dfs(
     arr = _to_array(board)
     frs, ovs, tos = _build_candidates(board)
 
-    # Warm up JIT before spawning so workers inherit compiled XLA kernels.
+    # Warm up JIT.
     _ = _valid_mask(arr, frs, ovs, tos)
 
     moves = _get_moves(arr, frs, ovs, tos)
@@ -190,23 +180,18 @@ def fast_dfs(
         return None
 
     moves = _order_moves(arr, frs, ovs, tos, moves)
-    worker_args = [
-        (arr, frs, ovs, tos, fr, ov, to, max_depth - 1, q)
-        for fr, ov, to in moves
-    ]
 
-    if n_workers == 1 or len(worker_args) == 1:
-        results = [_worker(a) for a in worker_args]
-    else:
-        ctx = multiprocessing.get_context("spawn")
-        with ctx.Pool(processes=n_workers) as pool:
-            results = pool.map(_worker, worker_args)
-
+    table: dict = {}
     best_score = int(arr.sum()) + 1
     best_move = None
-    for score, move in results:
+    for fr, ov, to in moves:
+        _apply(arr, fr, ov, to)
+        score = _dfs(arr, frs, ovs, tos, max_depth - 1, q, table)
+        _undo(arr, fr, ov, to)
         if score < best_score:
             best_score = score
-            best_move = move
+            best_move = (fr, ov, to)
+            if best_score == 1:  # optimal — no need to look further
+                break
 
     return best_move

@@ -6,11 +6,13 @@ Differences from fast_imitation_learning.py
 1. fast_dfs replaces fast_mcts as the labeling oracle:
      - Depth-limited DFS with transposition table and move ordering
      - JAX JIT-compiled move-validity check (warmed up inside fast_dfs)
-     - Root moves evaluated in parallel via multiprocessing (n_workers)
+     - Single-threaded per call
 
-2. No outer labeling pool — fast_dfs handles its own internal parallelism,
-   so nesting an extra Pool would cause spawn conflicts. States in a trajectory
-   are labeled sequentially; fast_dfs parallelises over root moves per call.
+2. Parallelism lives at the labeling level, not inside the oracle. fast_dfs
+   is single-threaded; instead the states of a trajectory are labeled
+   concurrently with a thread pool (n_workers threads). Each fast_dfs call
+   works on its own arrays/transposition table, and the JIT'd move check
+   releases the GIL, so calls overlap.
 
 3. mcts_time_limit → dfs_max_depth (and optional dfs_q for quiescence).
 
@@ -22,6 +24,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import keras
 
@@ -121,8 +124,8 @@ def _collect_trajectories(
 ) -> list[tuple[np.ndarray, int]]:
     """Generate n_trajectories rollouts, label every state with fast_dfs, return samples.
 
-    States are labeled sequentially because fast_dfs already parallelises
-    internally over root moves using n_workers processes.
+    fast_dfs is single-threaded; the states within a trajectory are labeled
+    concurrently using a pool of n_workers threads.
     """
     samples: list[tuple[np.ndarray, int]] = []
 
@@ -150,22 +153,27 @@ def _collect_trajectories(
         skipped = 0
         label_start = time.perf_counter()
 
-        for done, state in enumerate(trajectory, start=1):
-            move = fast_dfs(state, max_depth=dfs_max_depth, q=dfs_q, n_workers=n_workers)
-            if move is None:
-                skipped += 1
-            else:
-                samples.append((state.encode(), state.encode_move(move)))
-                labeled += 1
+        def _label(state):
+            return state, fast_dfs(state, max_depth=dfs_max_depth, q=dfs_q)
 
-            elapsed_label = time.perf_counter() - label_start
-            rate = done / elapsed_label if elapsed_label > 0 else 0
-            sys.stdout.write(
-                f"\r  labeling: {done:>{len(str(n_states))}}/{n_states} "
-                f"({done / n_states * 100:5.1f}%)  {rate:.2f} states/s  "
-                f"workers={n_workers}     "
-            )
-            sys.stdout.flush()
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = [pool.submit(_label, state) for state in trajectory]
+            for done, future in enumerate(as_completed(futures), start=1):
+                state, move = future.result()
+                if move is None:
+                    skipped += 1
+                else:
+                    samples.append((state.encode(), state.encode_move(move)))
+                    labeled += 1
+
+                elapsed_label = time.perf_counter() - label_start
+                rate = done / elapsed_label if elapsed_label > 0 else 0
+                sys.stdout.write(
+                    f"\r  labeling: {done:>{len(str(n_states))}}/{n_states} "
+                    f"({done / n_states * 100:5.1f}%)  {rate:.2f} states/s  "
+                    f"threads={n_workers}     "
+                )
+                sys.stdout.flush()
 
         label_time = time.perf_counter() - label_start
         sys.stdout.write("\n")
@@ -217,7 +225,7 @@ def dagger(
     n_initial_trajectories   — trajectories collected before iteration 1 to seed the dataset
     max_dataset_size         — cap on dataset length; oldest samples evicted first; None → unlimited
     save_path                — save model after each iteration; None disables saving
-    n_workers                — worker processes passed to fast_dfs for root-move parallelism
+    n_workers                — number of threads for concurrent state labeling
     log_path                 — JSONL file for progress logging; None disables logging
 
     Returns the final updated policy.
@@ -253,7 +261,7 @@ def dagger(
         dataset_size=0,
     )
 
-    print(f"Using fast_dfs teacher  (max_depth={dfs_max_depth}, q={dfs_q}, workers={n_workers})")
+    print(f"Using fast_dfs teacher  (max_depth={dfs_max_depth}, q={dfs_q}, label_threads={n_workers})")
 
     if n_initial_trajectories > 0:
         print(f"\n{'='*60}")

@@ -54,7 +54,9 @@ def play_game_nn(n: int, model_path: str) -> int:
 def play_game_dfs(n: int, max_depth: int, q: int, n_workers: int) -> int:
     board = SquareBoard(n)
     while True:
-        move = fast_dfs(board, max_depth=max_depth, q=q, n_workers=n_workers)
+        # fast_dfs is single-threaded now; n_workers is retained in the
+        # benchmark signature/CLI for compatibility but no longer used here.
+        move = fast_dfs(board, max_depth=max_depth, q=q)
         if move is None:
             break
         fr, ov, to = move
