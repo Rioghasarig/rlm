@@ -201,82 +201,94 @@ def _collect_trajectories(
     record_fn=None,
     iteration: int | None = None,
 ) -> list[tuple[np.ndarray, int]]:
-    """Generate n_trajectories rollouts, label every state with fast_dfs, return samples.
+    """Roll out n_trajectories from every initial board, label states, return samples.
 
-    Each rollout starts from a board sampled uniformly at random from
-    initial_boards (the set built by build_initial_boards). fast_dfs is
-    single-threaded; the states within a trajectory are labeled concurrently
-    using a pool of n_workers threads.
+    Every board in initial_boards (the set built by build_initial_boards) is used
+    as a start: n_trajectories rollouts are generated from each one, for a total of
+    len(initial_boards) * n_trajectories trajectories. fast_dfs is single-threaded;
+    the states within a trajectory are labeled concurrently using a pool of
+    n_workers threads.
     """
     samples: list[tuple[np.ndarray, int]] = []
 
-    for t in range(n_trajectories):
-        start_board = rng.choice(initial_boards)
-        start_pegs = len(start_board.pegs)
-        traj_start = time.perf_counter()
-        trajectory, final_board = _gen_trajectory(pi, start_board)
-        traj_time = time.perf_counter() - traj_start
-        pegs_left = int(final_board.encode()[..., 0].sum())
+    n_boards = len(initial_boards)
+    total_trajectories = n_boards * n_trajectories
+    t = 0  # global trajectory counter across all initial boards
 
-        traj_label = f"trajectory {t + 1}/{n_trajectories}" if n_trajectories > 1 else "trajectory"
-        print(f"\n  [{traj_label}]  start {start_pegs} pegs, {len(trajectory)} steps, "
-              f"{pegs_left} peg(s) remaining  ({traj_time:.2f}s)")
-        if record_fn is not None:
-            record_fn(
-                type="trajectory",
-                iteration=iteration,
-                trajectory_idx=t,
-                start_pegs=start_pegs,
-                steps=len(trajectory),
-                pegs_remaining=pegs_left,
-                traj_time_s=round(traj_time, 3),
-            )
+    for b_idx, start_board in enumerate(initial_boards):
+        for traj_in_board in range(n_trajectories):
+            start_pegs = len(start_board.pegs)
+            traj_start = time.perf_counter()
+            trajectory, final_board = _gen_trajectory(pi, start_board)
+            traj_time = time.perf_counter() - traj_start
+            pegs_left = int(final_board.encode()[..., 0].sum())
 
-        n_states = len(trajectory)
-        labeled = 0
-        skipped = 0
-        label_start = time.perf_counter()
-
-        def _label(state):
-            return state, fast_dfs(
-                state, max_depth=dfs_max_depth, q=dfs_q, max_breadth=dfs_max_breadth
-            )
-
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futures = [pool.submit(_label, state) for state in trajectory]
-            for done, future in enumerate(as_completed(futures), start=1):
-                state, move = future.result()
-                if move is None:
-                    skipped += 1
-                else:
-                    samples.append((state.encode(), state.encode_move(move)))
-                    labeled += 1
-
-                elapsed_label = time.perf_counter() - label_start
-                rate = done / elapsed_label if elapsed_label > 0 else 0
-                sys.stdout.write(
-                    f"\r  labeling: {done:>{len(str(n_states))}}/{n_states} "
-                    f"({done / n_states * 100:5.1f}%)  {rate:.2f} states/s  "
-                    f"threads={n_workers}     "
+            print(f"\n  [trajectory {t + 1}/{total_trajectories}  "
+                  f"board {b_idx + 1}/{n_boards}, rollout {traj_in_board + 1}/{n_trajectories}]  "
+                  f"start {start_pegs} pegs, {len(trajectory)} steps, "
+                  f"{pegs_left} peg(s) remaining  ({traj_time:.2f}s)")
+            if record_fn is not None:
+                record_fn(
+                    type="trajectory",
+                    iteration=iteration,
+                    trajectory_idx=t,
+                    board_idx=b_idx,
+                    rollout_idx=traj_in_board,
+                    start_pegs=start_pegs,
+                    steps=len(trajectory),
+                    pegs_remaining=pegs_left,
+                    traj_time_s=round(traj_time, 3),
                 )
-                sys.stdout.flush()
 
-        label_time = time.perf_counter() - label_start
-        sys.stdout.write("\n")
+            n_states = len(trajectory)
+            labeled = 0
+            skipped = 0
+            label_start = time.perf_counter()
 
-        print(f"  labeled {labeled}/{n_states} states  "
-              f"(skipped {skipped})  in {label_time:.1f}s  "
-              f"avg {label_time / n_states:.2f}s/state")
-        if record_fn is not None:
-            record_fn(
-                type="labeling",
-                iteration=iteration,
-                trajectory_idx=t,
-                labeled=labeled,
-                skipped=skipped,
-                label_time_s=round(label_time, 3),
-                rate_states_per_s=round(labeled / label_time if label_time > 0 else 0, 2),
-            )
+            def _label(state):
+                return state, fast_dfs(
+                    state, max_depth=dfs_max_depth, q=dfs_q, max_breadth=dfs_max_breadth
+                )
+
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = [pool.submit(_label, state) for state in trajectory]
+                for done, future in enumerate(as_completed(futures), start=1):
+                    state, move = future.result()
+                    if move is None:
+                        skipped += 1
+                    else:
+                        samples.append((state.encode(), state.encode_move(move)))
+                        labeled += 1
+
+                    elapsed_label = time.perf_counter() - label_start
+                    rate = done / elapsed_label if elapsed_label > 0 else 0
+                    sys.stdout.write(
+                        f"\r  labeling: {done:>{len(str(n_states))}}/{n_states} "
+                        f"({done / n_states * 100:5.1f}%)  {rate:.2f} states/s  "
+                        f"threads={n_workers}     "
+                    )
+                    sys.stdout.flush()
+
+            label_time = time.perf_counter() - label_start
+            sys.stdout.write("\n")
+
+            print(f"  labeled {labeled}/{n_states} states  "
+                  f"(skipped {skipped})  in {label_time:.1f}s  "
+                  f"avg {label_time / n_states:.2f}s/state")
+            if record_fn is not None:
+                record_fn(
+                    type="labeling",
+                    iteration=iteration,
+                    trajectory_idx=t,
+                    board_idx=b_idx,
+                    rollout_idx=traj_in_board,
+                    labeled=labeled,
+                    skipped=skipped,
+                    label_time_s=round(label_time, 3),
+                    rate_states_per_s=round(labeled / label_time if label_time > 0 else 0, 2),
+                )
+
+            t += 1
 
     return samples
 
@@ -302,8 +314,8 @@ def dagger(
     """DAgger using fast_dfs as the teacher, for SquareBoard.
 
     pi0                      — initial policy from build_square_policy_network
-    initial_boards           — set of starting boards; each rollout samples one
-                               uniformly at random (see build_initial_boards)
+    initial_boards           — set of starting boards (see build_initial_boards);
+                               every board is rolled out from each iteration
     optimizer                — e.g. keras.optimizers.Adam(1e-3)
     n_iterations             — DAgger iterations
     epochs                   — learn() epochs per iteration
@@ -311,8 +323,10 @@ def dagger(
     dfs_max_depth            — look-ahead depth for fast_dfs
     dfs_q                    — quiescence threshold (extend search when moves <= q)
     dfs_max_breadth          — max children expanded per node; None → expand all
-    n_trajectories           — trajectories rolled out per iteration (default 1)
-    n_initial_trajectories   — trajectories collected before iteration 1 to seed the dataset
+    n_trajectories           — rollouts per initial board per iteration; total
+                               trajectories = len(initial_boards) * n_trajectories
+    n_initial_trajectories   — rollouts per initial board collected before iteration 1
+                               to seed the dataset
     max_dataset_size         — cap on dataset length; oldest samples evicted first; None → unlimited
     save_path                — save model after each iteration; None disables saving
     n_workers                — number of threads for concurrent state labeling

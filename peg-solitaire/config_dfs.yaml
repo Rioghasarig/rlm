@@ -2,6 +2,12 @@ board:
   type: square                 # "square" (n×n grid) or "cross" (classic English 7×7 cross)
   n: 6                         # board side length (n×n grid); ignored when type is "cross"
   empty_start: null            # starting hole; null → centre (n//2, n//2 for square, (3,3) for cross)
+  init_set:                    # set of starting boards built by random descent from the standard board
+    branching: 5               # descendants generated per parent at each level
+    moves_per_step: 5          # random legal moves played to form each descendant
+    depth: 2                   # number of descent levels below the root (total = 1 + Σ_{d=1..depth} branching^d)
+    seed: null                 # RNG seed for reproducible board-set construction; null → nondeterministic
+    sample_seed: null          # RNG seed for per-trajectory start-board sampling; null → nondeterministic
 
 network:
   res_blocks: 2                # residual blocks in the policy tower
@@ -14,10 +20,10 @@ dagger:
   n_iterations: 50             # DAgger outer iterations
   epochs: 10                   # supervised-learning epochs per iteration
   batch_size: 128              # mini-batch size for learn()
-  dfs_max_depth: 5             # look-ahead depth for fast_dfs
-  dfs_q: 3                     # quiescence threshold: extend search when moves ≤ q
-  dfs_max_breadth: null        # max children expanded per node (most-open kept); null → expand all
-  n_trajectories: 5            # policy rollouts collected per iteration
+  dfs_max_depth: 7             # look-ahead depth for fast_dfs
+  dfs_q: 1                     # quiescence threshold: extend search when moves ≤ q
+  dfs_max_breadth: 5        # max children expanded per node (most-open kept); null → expand all
+  n_trajectories: 2            # policy rollouts collected per iteration
   n_initial_trajectories: 20  # trajectories collected before iteration 1 to seed the dataset; 0 → skip
   max_dataset_size: 5000      # oldest samples evicted when exceeded; null → unlimited
   save_path: policy_model_dfs.keras  # checkpoint path; set to null to disable
