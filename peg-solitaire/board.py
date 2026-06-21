@@ -219,9 +219,20 @@ class SquareBoard(Board):
         return c
 
     def encode(self) -> np.ndarray:
-        t = np.zeros((self.n, self.n), dtype=np.float32)
-        for (r, c) in self.pegs:
-            t[r, c] = 1.0
+        """Return an (n, n, 2) float32 tensor describing the position.
+
+        Channel 0 — pegs: 1.0 where a peg sits, else 0.0.
+        Channel 1 — in-bounds mask: 1.0 for playable holes, 0.0 for off-board
+                    cells (e.g. the CrossBoard corners). For a plain SquareBoard
+                    every cell is in bounds, so channel 1 is all ones.
+        """
+        t = np.zeros((self.n, self.n, 2), dtype=np.float32)
+        for row in range(self.n):
+            for col in range(self.n):
+                if self._in_bounds(row, col):
+                    t[row, col, 1] = 1.0
+                    if (row, col) in self.pegs:
+                        t[row, col, 0] = 1.0
         return t
 
     def encode_move(self, move: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]) -> int:
@@ -242,5 +253,53 @@ class SquareBoard(Board):
         rows = []
         for row in range(self.n):
             cells = " ".join("o" if (row, col) in self.pegs else "." for col in range(self.n))
+            rows.append(cells)
+        return "\n".join(rows)
+
+
+class CrossBoard(SquareBoard):
+    """
+    The classic English peg solitaire board: a plus/cross shape carved out of
+    a 7×7 grid by removing the four 2×2 corner blocks, leaving 33 holes.
+
+    A cell (row, col) is part of the board when it lies in the central three
+    rows or the central three columns; the corners (where both row and col fall
+    in {0, 1, 5, 6}) are off the board.
+
+    Pegs jump orthogonally exactly two steps, removing the peg in between.
+    The standard starting position has every hole filled except the centre.
+    """
+
+    n = 7
+
+    def __init__(self, empty_start: tuple[int, int] = (3, 3)):
+        self.pegs: set[tuple[int, int]] = {
+            (row, col)
+            for row in range(self.n)
+            for col in range(self.n)
+            if self._in_bounds(row, col)
+        }
+        if not self._in_bounds(*empty_start):
+            raise ValueError(f"empty_start {empty_start} is not on the board")
+        self.pegs.discard(empty_start)
+
+    def _in_bounds(self, row: int, col: int) -> bool:
+        if not (0 <= row < self.n and 0 <= col < self.n):
+            return False
+        arm = self.n // 3  # = 2 for the standard 7×7 board
+        return (arm <= row < self.n - arm) or (arm <= col < self.n - arm)
+
+    def copy(self) -> 'CrossBoard':
+        c = CrossBoard.__new__(CrossBoard)
+        c.pegs = self.pegs.copy()
+        return c
+
+    def __repr__(self) -> str:
+        rows = []
+        for row in range(self.n):
+            cells = " ".join(
+                ("o" if (row, col) in self.pegs else ".") if self._in_bounds(row, col) else " "
+                for col in range(self.n)
+            )
             rows.append(cells)
         return "\n".join(rows)

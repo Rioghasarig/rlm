@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import keras
 
-from board import SquareBoard
+from board import SquareBoard, CrossBoard
 from fast_dfs import fast_dfs
 from policy_network_square import select_action
 
@@ -68,7 +68,7 @@ def learn(
     record_fn=None,
     iteration: int | None = None,
 ) -> keras.Model:
-    states  = np.array([s for s, _ in D], dtype=np.float32)[..., np.newaxis]  # (N, n, n, 1)
+    states  = np.array([s for s, _ in D], dtype=np.float32)  # (N, n, n, 2)
     actions = np.array([a for _, a in D], dtype=np.int32)                      # (N,)
 
     _ensure_jit_compiled(policy_model, optimizer)
@@ -118,6 +118,7 @@ def _collect_trajectories(
     n_trajectories: int,
     dfs_max_depth: int,
     dfs_q: int,
+    dfs_max_breadth: int | None,
     n_workers: int,
     record_fn=None,
     iteration: int | None = None,
@@ -133,7 +134,7 @@ def _collect_trajectories(
         traj_start = time.perf_counter()
         trajectory, final_board = _gen_trajectory(pi, initial_board)
         traj_time = time.perf_counter() - traj_start
-        pegs_left = int(final_board.encode().sum())
+        pegs_left = int(final_board.encode()[..., 0].sum())
 
         traj_label = f"trajectory {t + 1}/{n_trajectories}" if n_trajectories > 1 else "trajectory"
         print(f"\n  [{traj_label}]  {len(trajectory)} steps, "
@@ -154,7 +155,9 @@ def _collect_trajectories(
         label_start = time.perf_counter()
 
         def _label(state):
-            return state, fast_dfs(state, max_depth=dfs_max_depth, q=dfs_q)
+            return state, fast_dfs(
+                state, max_depth=dfs_max_depth, q=dfs_q, max_breadth=dfs_max_breadth
+            )
 
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             futures = [pool.submit(_label, state) for state in trajectory]
@@ -204,6 +207,7 @@ def dagger(
     batch_size: int,
     dfs_max_depth: int = 8,
     dfs_q: int = 1,
+    dfs_max_breadth: int | None = None,
     n_trajectories: int = 1,
     n_initial_trajectories: int = 0,
     max_dataset_size: int | None = None,
@@ -221,6 +225,7 @@ def dagger(
     batch_size               — learn() batch size
     dfs_max_depth            — look-ahead depth for fast_dfs
     dfs_q                    — quiescence threshold (extend search when moves <= q)
+    dfs_max_breadth          — max children expanded per node; None → expand all
     n_trajectories           — trajectories rolled out per iteration (default 1)
     n_initial_trajectories   — trajectories collected before iteration 1 to seed the dataset
     max_dataset_size         — cap on dataset length; oldest samples evicted first; None → unlimited
@@ -256,12 +261,14 @@ def dagger(
         batch_size=batch_size,
         dfs_max_depth=dfs_max_depth,
         dfs_q=dfs_q,
+        dfs_max_breadth=dfs_max_breadth,
         n_workers=n_workers,
         board_n=initial_board.n,
         dataset_size=0,
     )
 
-    print(f"Using fast_dfs teacher  (max_depth={dfs_max_depth}, q={dfs_q}, label_threads={n_workers})")
+    print(f"Using fast_dfs teacher  (max_depth={dfs_max_depth}, q={dfs_q}, "
+          f"max_breadth={dfs_max_breadth}, label_threads={n_workers})")
 
     if n_initial_trajectories > 0:
         print(f"\n{'='*60}")
@@ -269,7 +276,7 @@ def dagger(
         print(f"{'='*60}")
         initial_samples = _collect_trajectories(
             pi, initial_board, n_initial_trajectories,
-            dfs_max_depth, dfs_q, n_workers,
+            dfs_max_depth, dfs_q, dfs_max_breadth, n_workers,
             record_fn=record, iteration=0,
         )
         _append_samples(D, initial_samples)
@@ -287,7 +294,7 @@ def dagger(
 
         new_samples_list = _collect_trajectories(
             pi, initial_board, n_trajectories,
-            dfs_max_depth, dfs_q, n_workers,
+            dfs_max_depth, dfs_q, dfs_max_breadth, n_workers,
             record_fn=record, iteration=i + 1,
         )
         _append_samples(D, new_samples_list)
@@ -343,9 +350,17 @@ def main(config_path: str = "config_dfs.yaml") -> None:
 
     # Board
     bc          = cfg["board"]
-    n           = bc["n"]
+    board_type  = bc.get("type", "square").lower()
     empty_start = tuple(bc["empty_start"]) if bc.get("empty_start") else None
-    board       = SquareBoard(n, empty_start=empty_start)
+    if board_type == "cross":
+        # CrossBoard is the classic English 7×7 cross; n is fixed at 7 and
+        # only the empty starting hole is configurable (defaults to centre).
+        board = CrossBoard(**({"empty_start": empty_start} if empty_start else {}))
+    elif board_type == "square":
+        board = SquareBoard(bc["n"], empty_start=empty_start)
+    else:
+        raise ValueError(f"Unknown board type {board_type!r}; expected 'square' or 'cross'")
+    n = board.n
 
     # Network
     nc  = cfg["network"]
@@ -385,6 +400,7 @@ def main(config_path: str = "config_dfs.yaml") -> None:
         batch_size=dc["batch_size"],
         dfs_max_depth=dc.get("dfs_max_depth", 8),
         dfs_q=dc.get("dfs_q", 1),
+        dfs_max_breadth=dc.get("dfs_max_breadth"),
         n_trajectories=dc.get("n_trajectories", 1),
         n_initial_trajectories=dc.get("n_initial_trajectories", 0),
         max_dataset_size=dc.get("max_dataset_size"),

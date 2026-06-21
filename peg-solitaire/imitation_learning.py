@@ -16,15 +16,15 @@ def learn(
     """Train policy_model on a dataset of (board_encoding, action_code) pairs.
 
     D               — list of (encoded_board, action_code) where encoded_board
-                      has shape (n, n) and action_code is from board.encode_move()
-    policy_model    — built with build_square_policy_network; expects (B, n, n, 1) input
+                      has shape (n, n, 2) and action_code is from board.encode_move()
+    policy_model    — built with build_square_policy_network; expects (B, n, n, 2) input
     optimizer       — e.g. keras.optimizers.Adam(1e-3)
     epochs          — number of full passes over D
     batch_size      — mini-batch size
 
     Returns the updated policy model.
     """
-    states = np.array([s for s, _ in D], dtype=np.float32)[..., np.newaxis]  # (N, n, n, 1)
+    states = np.array([s for s, _ in D], dtype=np.float32)  # (N, n, n, 2)
     actions = np.array([a for _, a in D], dtype=np.int32)                     # (N,)
 
     loss_fn = keras.losses.SparseCategoricalCrossentropy(from_logits=True)

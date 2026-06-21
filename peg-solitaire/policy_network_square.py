@@ -19,12 +19,13 @@ def _residual_block(x, filters):
 def build_square_policy_network(n: int, res_blocks: int = 4, filters: int = 64) -> keras.Model:
     """Policy network for SquareBoard of size n.
 
-    Input shape:  (batch, n, n, 1)  — board.encode()[..., np.newaxis]
+    Input shape:  (batch, n, n, 2)  — board.encode() with a batch axis
+                  (channel 0 = pegs, channel 1 = in-bounds mask)
     Output shape: (batch, n*n*4)    — raw logits over encode_move action codes
     """
     action_size = n * n * len(SquareBoard._DIRECTIONS)
 
-    inp = keras.Input(shape=(n, n, 1), name='board')
+    inp = keras.Input(shape=(n, n, 2), name='board')
 
     x = layers.Conv2D(filters, 3, padding='same')(inp)
     x = layers.BatchNormalization()(x)
@@ -43,8 +44,8 @@ def build_square_policy_network(n: int, res_blocks: int = 4, filters: int = 64) 
 
 
 def encode_board(board: SquareBoard) -> np.ndarray:
-    """Return (1, n, n, 1) float32 array ready for model input."""
-    return board.encode()[np.newaxis, ..., np.newaxis]
+    """Return (1, n, n, 2) float32 array ready for model input."""
+    return board.encode()[np.newaxis, ...]
 
 
 def select_action(model: keras.Model, board: SquareBoard, greedy: bool = False) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:

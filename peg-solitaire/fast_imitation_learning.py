@@ -120,14 +120,14 @@ def learn(
     subsequent calls with the same instance, preserving optimizer state.
 
     D               — list of (encoded_board, action_code) pairs
-    policy_model    — built with build_square_policy_network; expects (B,n,n,1)
+    policy_model    — built with build_square_policy_network; expects (B,n,n,2)
     optimizer       — e.g. keras.optimizers.Adam(1e-3)
     epochs          — number of full passes over D
     batch_size      — mini-batch size
 
     Returns the updated policy model.
     """
-    states  = np.array([s for s, _ in D], dtype=np.float32)[..., np.newaxis]  # (N, n, n, 1)
+    states  = np.array([s for s, _ in D], dtype=np.float32)  # (N, n, n, 2)
     actions = np.array([a for _, a in D], dtype=np.int32)                      # (N,)
 
     _ensure_jit_compiled(policy_model, optimizer)
@@ -188,7 +188,7 @@ def _collect_trajectories(
         traj_start = time.perf_counter()
         trajectory, final_board = _gen_trajectory(pi, initial_board)
         traj_time = time.perf_counter() - traj_start
-        pegs_left = int(final_board.encode().sum())
+        pegs_left = int(final_board.encode()[..., 0].sum())
 
         traj_label = f"trajectory {t + 1}/{n_trajectories}" if n_trajectories > 1 else "trajectory"
         print(f"\n  [{traj_label}]  {len(trajectory)} steps, "
