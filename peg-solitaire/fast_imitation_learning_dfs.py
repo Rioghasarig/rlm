@@ -304,7 +304,6 @@ def dagger(
     dfs_q: int = 1,
     dfs_max_breadth: int | None = None,
     n_trajectories: int = 1,
-    n_initial_trajectories: int = 0,
     max_dataset_size: int | None = None,
     save_path: str | None = "policy_model.keras",
     n_workers: int | None = None,
@@ -325,8 +324,6 @@ def dagger(
     dfs_max_breadth          — max children expanded per node; None → expand all
     n_trajectories           — rollouts per initial board per iteration; total
                                trajectories = len(initial_boards) * n_trajectories
-    n_initial_trajectories   — rollouts per initial board collected before iteration 1
-                               to seed the dataset
     max_dataset_size         — cap on dataset length; oldest samples evicted first; None → unlimited
     save_path                — save model after each iteration; None disables saving
     n_workers                — number of threads for concurrent state labeling
@@ -357,7 +354,6 @@ def dagger(
         type="run_start",
         n_iterations=n_iterations,
         n_trajectories=n_trajectories,
-        n_initial_trajectories=n_initial_trajectories,
         epochs=epochs,
         batch_size=batch_size,
         dfs_max_depth=dfs_max_depth,
@@ -371,19 +367,6 @@ def dagger(
 
     print(f"Using fast_dfs teacher  (max_depth={dfs_max_depth}, q={dfs_q}, "
           f"max_breadth={dfs_max_breadth}, label_threads={n_workers})")
-
-    if n_initial_trajectories > 0:
-        print(f"\n{'='*60}")
-        print(f"Pre-DAgger data collection: {n_initial_trajectories} initial trajectory/trajectories")
-        print(f"{'='*60}")
-        initial_samples = _collect_trajectories(
-            pi, initial_boards, n_initial_trajectories,
-            dfs_max_depth, dfs_q, dfs_max_breadth, n_workers, sample_rng,
-            record_fn=record, iteration=0,
-        )
-        _append_samples(D, initial_samples)
-        print(f"\n  collected {len(initial_samples)} initial samples  (dataset now {len(D)})")
-        record(type="initial_collection_end", dataset_size=len(D))
 
     for i in range(n_iterations):
         iter_start = time.perf_counter()
@@ -518,7 +501,6 @@ def main(config_path: str = "config_dfs.yaml") -> None:
         dfs_q=dc.get("dfs_q", 1),
         dfs_max_breadth=dc.get("dfs_max_breadth"),
         n_trajectories=dc.get("n_trajectories", 1),
-        n_initial_trajectories=dc.get("n_initial_trajectories", 0),
         max_dataset_size=dc.get("max_dataset_size"),
         save_path=dc.get("save_path"),
         n_workers=dc.get("n_workers"),
