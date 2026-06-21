@@ -1,6 +1,6 @@
 board:
-  type: square                 # "square" (n×n grid) or "cross" (classic English 7×7 cross)
-  n: 6                         # board side length (n×n grid); ignored when type is "cross"
+  type: cross                 # "square" (n×n grid) or "cross" (classic English 7×7 cross)
+  n: 7                         # board side length (n×n grid); ignored when type is "cross"
   empty_start: null            # starting hole; null → centre (n//2, n//2 for square, (3,3) for cross)
   init_set:                    # set of starting boards built by random descent from the standard board
     branching: 5               # descendants generated per parent at each level
