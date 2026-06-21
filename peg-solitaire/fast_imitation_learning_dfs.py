@@ -25,7 +25,7 @@ import os
 import random
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from joblib import Parallel, delayed
 import numpy as np
 import keras
 
@@ -189,6 +189,13 @@ def build_initial_boards(
 
 # ── DAgger ────────────────────────────────────────────────────────────────────
 
+def _label_state(state, dfs_max_depth, dfs_q, dfs_max_breadth):
+    """Label a single state with the oracle move (top-level so it is picklable)."""
+    return state, fast_dfs(
+        state, max_depth=dfs_max_depth, q=dfs_q, max_breadth=dfs_max_breadth
+    )
+
+
 def _collect_trajectories(
     pi: keras.Model,
     initial_boards: list[SquareBoard],
@@ -245,29 +252,27 @@ def _collect_trajectories(
             skipped = 0
             label_start = time.perf_counter()
 
-            def _label(state):
-                return state, fast_dfs(
-                    state, max_depth=dfs_max_depth, q=dfs_q, max_breadth=dfs_max_breadth
+            results = Parallel(
+                n_jobs=n_workers, backend="loky", return_as="generator_unordered"
+            )(
+                delayed(_label_state)(state, dfs_max_depth, dfs_q, dfs_max_breadth)
+                for state in trajectory
+            )
+            for done, (state, move) in enumerate(results, start=1):
+                if move is None:
+                    skipped += 1
+                else:
+                    samples.append((state.encode(), state.encode_move(move)))
+                    labeled += 1
+
+                elapsed_label = time.perf_counter() - label_start
+                rate = done / elapsed_label if elapsed_label > 0 else 0
+                sys.stdout.write(
+                    f"\r  labeling: {done:>{len(str(n_states))}}/{n_states} "
+                    f"({done / n_states * 100:5.1f}%)  {rate:.2f} states/s  "
+                    f"procs={n_workers}     "
                 )
-
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                futures = [pool.submit(_label, state) for state in trajectory]
-                for done, future in enumerate(as_completed(futures), start=1):
-                    state, move = future.result()
-                    if move is None:
-                        skipped += 1
-                    else:
-                        samples.append((state.encode(), state.encode_move(move)))
-                        labeled += 1
-
-                    elapsed_label = time.perf_counter() - label_start
-                    rate = done / elapsed_label if elapsed_label > 0 else 0
-                    sys.stdout.write(
-                        f"\r  labeling: {done:>{len(str(n_states))}}/{n_states} "
-                        f"({done / n_states * 100:5.1f}%)  {rate:.2f} states/s  "
-                        f"threads={n_workers}     "
-                    )
-                    sys.stdout.flush()
+                sys.stdout.flush()
 
             label_time = time.perf_counter() - label_start
             sys.stdout.write("\n")
