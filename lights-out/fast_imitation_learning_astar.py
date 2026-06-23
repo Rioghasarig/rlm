@@ -1,22 +1,27 @@
 """
-fast_imitation_learning_dtfs.py — DAgger for SquareBoard peg solitaire using fast_dfs as teacher.
+fast_imitation_learning_astar.py — DAgger for SquareLightsBoard (Lights Out)
+using A* as the labeling teacher.
 
-Differences from fast_imitation_learning.py
---------------------------------------------
-1. fast_dfs replaces fast_mcts as the labeling oracle:
-     - Depth-limited DFS with transposition table and move ordering
-     - JAX JIT-compiled move-validity check (warmed up inside fast_dfs)
-     - Single-threaded per call
+This mirrors fast_imitation_learning_dfs.py from the peg-solitaire project, with
+the pieces swapped for Lights Out:
 
-2. Parallelism lives at the labeling level, not inside the oracle. fast_dfs
-   is single-threaded; instead the states of a trajectory are labeled
-   concurrently with a thread pool (n_workers threads). Each fast_dfs call
-   works on its own arrays/transposition table, and the JIT'd move check
-   releases the GIL, so calls overlap.
+1. astar replaces fast_dfs as the labeling oracle. astar returns a full
+   solution path (a *list* of presses) from a given state; the imitation label
+   for a state is the *first* press on that path. States the oracle cannot
+   improve (an empty path — already solved/best) are skipped.
 
-3. mcts_time_limit → dfs_max_depth (and optional dfs_q for quiescence).
+2. Parallelism lives at the labeling level, not inside the oracle. astar is
+   single-threaded; instead the states of a trajectory are labeled
+   concurrently with a process pool (n_workers). Each astar call works on its
+   own copy of the board, so the calls are independent.
 
-4. reward_mode is not applicable (DFS always minimises pegs remaining).
+3. mcts_time_limit / dfs_max_depth → astar_max_expansions.
+
+4. The initial-board set is built with SquareLightsBoard.scramble: a collection
+   of random, guaranteed-solvable boards reached by applying k random presses
+   to the all-off state (see build_initial_boards).
+
+5. reward_mode is not applicable (A* always minimises lights remaining).
 """
 from __future__ import annotations
 
@@ -29,8 +34,8 @@ from joblib import Parallel, delayed
 import numpy as np
 import keras
 
-from board import SquareBoard, CrossBoard
-from fast_dfs import fast_dfs
+from board import SquareLightsBoard
+from astar import astar
 from policy_network_square import select_action
 
 
@@ -70,7 +75,7 @@ def learn(
     iteration: int | None = None,
 ) -> keras.Model:
     states  = np.array([s for s, _ in D], dtype=np.float32)  # (N, n, n, 2)
-    actions = np.array([a for _, a in D], dtype=np.int32)                      # (N,)
+    actions = np.array([a for _, a in D], dtype=np.int32)     # (N,)
 
     _ensure_jit_compiled(policy_model, optimizer)
 
@@ -99,113 +104,93 @@ def learn(
 # ── Trajectory generation ─────────────────────────────────────────────────────
 
 def _gen_trajectory(
-    policy: keras.Model, board: SquareBoard
-) -> tuple[list[SquareBoard], SquareBoard]:
-    """Roll out policy from board; return (states visited, terminal board)."""
-    states: list[SquareBoard] = []
+    policy: keras.Model, board: SquareLightsBoard
+) -> tuple[list[SquareLightsBoard], SquareLightsBoard]:
+    """Roll out policy from board; return (states visited, terminal board).
+
+    Presses are sampled from the policy until the board is over — either solved
+    (no lights remain) or every cell has been pressed (no legal moves left).
+    The trajectory is bounded by n² steps.
+    """
+    states: list[SquareLightsBoard] = []
     b = board.copy()
-    while b.available_moves():
+    while not b.is_over():
         states.append(b.copy())
         move = select_action(policy, b, greedy=False)
-        b.move(move[0], move[2])
+        b.apply(move)
     return states, b
 
 
 # ── Initial-board set construction ─────────────────────────────────────────────
 
-def _random_descendant(parent: SquareBoard, n_moves: int, rng: random.Random):
-    """Play n_moves random legal moves from parent.
-
-    Returns the resulting board, or None if it dead-ends (no legal moves) before
-    n_moves have been played.
-    """
-    b = parent.copy()
-    for _ in range(n_moves):
-        moves = b.available_moves()
-        if not moves:
-            return None
-        mv = rng.choice(moves)
-        b.move(mv[0], mv[2])
-    return b
-
-
 def build_initial_boards(
-    base_board: SquareBoard,
+    n: int,
     *,
-    branching: int = 5,
-    moves_per_step: int = 2,
-    depth: int = 5,
+    num_boards: int = 30,
+    scramble_k: int = 10,
     seed: int | None = None,
-    max_tries_per_child: int = 200,
-) -> list[SquareBoard]:
-    """Build a set of starting boards by repeated random descent from base_board.
+    max_tries_per_board: int = 200,
+) -> list[SquareLightsBoard]:
+    """Build a set of random, guaranteed-solvable starting boards.
 
-    Level 0 is base_board itself. Every board at level d is expanded into
-    `branching` children, each child reached by playing `moves_per_step` random
-    legal moves from that parent. The construction runs for `depth` levels.
+    Each board is produced by SquareLightsBoard.scramble(n, scramble_k): from
+    the all-off (solved) position, scramble_k random presses are applied. Because
+    presses are reversible, every scrambled board is solvable.
 
-    All boards produced are de-duplicated by peg configuration, so no two starts
-    in the returned set are identical (this is what guarantees "no repeats" both
-    among siblings and across all boards generated at a given level). Because
-    every board at a level has the same peg count (base − level·moves_per_step),
-    a single global `seen` set is enough — boards from different levels can never
-    collide.
+    Boards are de-duplicated by light configuration so the returned set contains
+    no two identical starts. If `seed` is given, board i uses seed + i so the set
+    is reproducible; duplicates are retried with fresh offset seeds.
 
-    Returns base_board plus every descendant: 1 + Σ_{d=1..depth} branching^d boards.
-    With the defaults (branching=5, depth=2) that is 1 + 5 + 25 = 31 boards.
+    Returns a list of `num_boards` distinct boards.
     """
-    rng = random.Random(seed)
-    seen: set[frozenset] = {frozenset(base_board.pegs)}
-    all_boards: list[SquareBoard] = [base_board.copy()]
-    frontier: list[SquareBoard] = [base_board]
+    boards: list[SquareLightsBoard] = []
+    seen: set[frozenset] = set()
+    next_offset = 0
 
-    for level in range(depth):
-        next_frontier: list[SquareBoard] = []
-        for parent in frontier:
-            produced = 0
-            tries = 0
-            while produced < branching:
-                if tries >= max_tries_per_child * branching:
-                    raise RuntimeError(
-                        f"build_initial_boards: only generated {produced}/{branching} "
-                        f"unique descendants at level {level + 1} after {tries} tries. "
-                        f"Reduce branching/moves_per_step/depth or use a larger board."
-                    )
-                tries += 1
-                child = _random_descendant(parent, moves_per_step, rng)
+    for _ in range(num_boards):
+        tries = 0
+        while True:
+            if tries >= max_tries_per_board:
+                raise RuntimeError(
+                    f"build_initial_boards: could not find a new unique board after "
+                    f"{tries} tries (have {len(boards)}/{num_boards}). "
+                    f"Increase scramble_k or board size, or reduce num_boards."
+                )
+            tries += 1
+            board_seed = None if seed is None else seed + next_offset
+            next_offset += 1
+            board = SquareLightsBoard.scramble(n, scramble_k, seed=board_seed)
+            key = frozenset(board.lights)
+            if key in seen:
+                continue  # duplicate configuration — try another scramble
+            seen.add(key)
+            boards.append(board)
+            break
 
-                if child is None:
-                    continue  # dead-ended before moves_per_step moves
-                key = frozenset(child.pegs)
-                if key in seen:
-                    continue  # duplicate position — try again
-                seen.add(key)
-                next_frontier.append(child)
-                all_boards.append(child)
-                produced += 1
-        frontier = next_frontier
-
-    return all_boards
+    return boards
 
 
 # ── DAgger ────────────────────────────────────────────────────────────────────
 
-def _label_state(state, dfs_max_depth, dfs_q, dfs_max_breadth):
-    """Label a single state with the oracle move (top-level so it is picklable)."""
-    return state, fast_dfs(
-        state, max_depth=dfs_max_depth, q=dfs_q, max_breadth=dfs_max_breadth
-    )
+def _label_state(state, astar_max_expansions):
+    """Label a single state with the oracle's first press (top-level → picklable).
+
+    astar returns the full press path to the best state it finds. The imitation
+    label is the *first* press on that path. An empty path means the oracle could
+    not improve on the state (e.g. already solved); such states return None and
+    are skipped during collection.
+    """
+    path = astar(state, max_expansions=astar_max_expansions)
+    move = path[0] if path else None
+    return state, move
 
 
 def _collect_trajectories(
     pi: keras.Model,
-    initial_boards: list[SquareBoard],
+    initial_boards: list[SquareLightsBoard],
     n_trajectories: int,
-    dfs_max_depth: int,
-    dfs_q: int,
-    dfs_max_breadth: int | None,
+    astar_max_expansions: int | None,
     n_workers: int,
-    rng: random.Random,
     record_fn=None,
     iteration: int | None = None,
 ) -> list[tuple[np.ndarray, int]]:
@@ -213,9 +198,9 @@ def _collect_trajectories(
 
     Every board in initial_boards (the set built by build_initial_boards) is used
     as a start: n_trajectories rollouts are generated from each one, for a total of
-    len(initial_boards) * n_trajectories trajectories. fast_dfs is single-threaded;
+    len(initial_boards) * n_trajectories trajectories. astar is single-threaded;
     the states within a trajectory are labeled concurrently using a pool of
-    n_workers threads.
+    n_workers processes.
     """
     samples: list[tuple[np.ndarray, int]] = []
 
@@ -225,16 +210,16 @@ def _collect_trajectories(
 
     for b_idx, start_board in enumerate(initial_boards):
         for traj_in_board in range(n_trajectories):
-            start_pegs = len(start_board.pegs)
+            start_lights = start_board.score()
             traj_start = time.perf_counter()
             trajectory, final_board = _gen_trajectory(pi, start_board)
             traj_time = time.perf_counter() - traj_start
-            pegs_left = int(final_board.encode()[..., 0].sum())
+            lights_left = final_board.score()
 
             print(f"\n  [trajectory {t + 1}/{total_trajectories}  "
                   f"board {b_idx + 1}/{n_boards}, rollout {traj_in_board + 1}/{n_trajectories}]  "
-                  f"start {start_pegs} pegs, {len(trajectory)} steps, "
-                  f"{pegs_left} peg(s) remaining  ({traj_time:.2f}s)")
+                  f"start {start_lights} lights, {len(trajectory)} steps, "
+                  f"{lights_left} light(s) remaining  ({traj_time:.2f}s)")
             if record_fn is not None:
                 record_fn(
                     type="trajectory",
@@ -242,9 +227,9 @@ def _collect_trajectories(
                     trajectory_idx=t,
                     board_idx=b_idx,
                     rollout_idx=traj_in_board,
-                    start_pegs=start_pegs,
+                    start_lights=start_lights,
                     steps=len(trajectory),
-                    pegs_remaining=pegs_left,
+                    lights_remaining=lights_left,
                     traj_time_s=round(traj_time, 3),
                 )
 
@@ -256,7 +241,7 @@ def _collect_trajectories(
             results = Parallel(
                 n_jobs=n_workers, backend="loky", return_as="generator_unordered"
             )(
-                delayed(_label_state)(state, dfs_max_depth, dfs_q, dfs_max_breadth)
+                delayed(_label_state)(state, astar_max_expansions)
                 for state in trajectory
             )
             for done, (state, move) in enumerate(results, start=1):
@@ -280,7 +265,7 @@ def _collect_trajectories(
 
             print(f"  labeled {labeled}/{n_states} states  "
                   f"(skipped {skipped})  in {label_time:.1f}s  "
-                  f"avg {label_time / n_states:.2f}s/state")
+                  f"avg {label_time / max(n_states, 1):.2f}s/state")
             if record_fn is not None:
                 record_fn(
                     type="labeling",
@@ -301,22 +286,19 @@ def _collect_trajectories(
 
 def dagger(
     pi0: keras.Model,
-    initial_boards: list[SquareBoard],
+    initial_boards: list[SquareLightsBoard],
     optimizer: keras.optimizers.Optimizer,
     n_iterations: int,
     epochs: int,
     batch_size: int,
-    dfs_max_depth: int = 8,
-    dfs_q: int = 1,
-    dfs_max_breadth: int | None = None,
+    astar_max_expansions: int | None = 10000,
     n_trajectories: int = 1,
     max_dataset_size: int | None = None,
     save_path: str | None = "policy_model.keras",
     n_workers: int | None = None,
     log_path: str | None = None,
-    sample_seed: int | None = None,
 ) -> keras.Model:
-    """DAgger using fast_dfs as the teacher, for SquareBoard.
+    """DAgger using astar as the teacher, for SquareLightsBoard (Lights Out).
 
     pi0                      — initial policy from build_square_policy_network
     initial_boards           — set of starting boards (see build_initial_boards);
@@ -325,21 +307,18 @@ def dagger(
     n_iterations             — DAgger iterations
     epochs                   — learn() epochs per iteration
     batch_size               — learn() batch size
-    dfs_max_depth            — look-ahead depth for fast_dfs
-    dfs_q                    — quiescence threshold (extend search when moves <= q)
-    dfs_max_breadth          — max children expanded per node; None → expand all
+    astar_max_expansions     — node-expansion budget for the astar teacher;
+                               None → search until solved or exhausted
     n_trajectories           — rollouts per initial board per iteration; total
                                trajectories = len(initial_boards) * n_trajectories
     max_dataset_size         — cap on dataset length; oldest samples evicted first; None → unlimited
     save_path                — save model after each iteration; None disables saving
-    n_workers                — number of threads for concurrent state labeling
+    n_workers                — number of processes for concurrent state labeling
     log_path                 — JSONL file for progress logging; None disables logging
-    sample_seed              — seed for per-trajectory start-board sampling; None → nondeterministic
 
     Returns the final updated policy.
     """
     n_workers = n_workers or (os.cpu_count() or 1)
-    sample_rng = random.Random(sample_seed)
 
     _ensure_jit_compiled(pi0, optimizer)
 
@@ -362,17 +341,15 @@ def dagger(
         n_trajectories=n_trajectories,
         epochs=epochs,
         batch_size=batch_size,
-        dfs_max_depth=dfs_max_depth,
-        dfs_q=dfs_q,
-        dfs_max_breadth=dfs_max_breadth,
+        astar_max_expansions=astar_max_expansions,
         n_workers=n_workers,
         board_n=initial_boards[0].n,
         n_initial_boards=len(initial_boards),
         dataset_size=0,
     )
 
-    print(f"Using fast_dfs teacher  (max_depth={dfs_max_depth}, q={dfs_q}, "
-          f"max_breadth={dfs_max_breadth}, label_threads={n_workers})")
+    print(f"Using astar teacher  (max_expansions={astar_max_expansions}, "
+          f"label_procs={n_workers})")
 
     for i in range(n_iterations):
         iter_start = time.perf_counter()
@@ -385,7 +362,7 @@ def dagger(
 
         new_samples_list = _collect_trajectories(
             pi, initial_boards, n_trajectories,
-            dfs_max_depth, dfs_q, dfs_max_breadth, n_workers, sample_rng,
+            astar_max_expansions, n_workers,
             record_fn=record, iteration=i + 1,
         )
         _append_samples(D, new_samples_list)
@@ -429,46 +406,34 @@ def _load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def main(config_path: str = "config_dfs.yaml") -> None:
+def main(config_path: str = "config_astar.yaml") -> None:
     import argparse
     from policy_network_square import build_square_policy_network
 
-    parser = argparse.ArgumentParser(description="DAgger with fast_dfs teacher for peg solitaire")
+    parser = argparse.ArgumentParser(description="DAgger with astar teacher for Lights Out")
     parser.add_argument("--config", default=config_path, help="Path to YAML config file")
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
 
     # Board
-    bc          = cfg["board"]
-    board_type  = bc.get("type", "square").lower()
-    empty_start = tuple(bc["empty_start"]) if bc.get("empty_start") else None
-    if board_type == "cross":
-        # CrossBoard is the classic English 7×7 cross; n is fixed at 7 and
-        # only the empty starting hole is configurable (defaults to centre).
-        board = CrossBoard(**({"empty_start": empty_start} if empty_start else {}))
-    elif board_type == "square":
-        board = SquareBoard(bc["n"], empty_start=empty_start)
-    else:
-        raise ValueError(f"Unknown board type {board_type!r}; expected 'square' or 'cross'")
-    n = board.n
+    bc = cfg["board"]
+    n = bc["n"]
 
-    # Initial-board set: the standard board plus random-descent descendants.
+    # Initial-board set: random solvable boards built with scramble.
     isc = bc.get("init_set") or {}
     initial_boards = build_initial_boards(
-        board,
-        branching=isc.get("branching", 5),
-        moves_per_step=isc.get("moves_per_step", 5),
-        depth=isc.get("depth", 2),
+        n,
+        num_boards=isc.get("num_boards", 30),
+        scramble_k=isc.get("scramble_k", 10),
         seed=isc.get("seed"),
     )
     print(f"Initial-board set: {len(initial_boards)} boards "
-          f"(branching={isc.get('branching', 5)}, "
-          f"moves_per_step={isc.get('moves_per_step', 5)}, "
-          f"depth={isc.get('depth', 2)})")
+          f"(num_boards={isc.get('num_boards', 30)}, "
+          f"scramble_k={isc.get('scramble_k', 10)})")
 
     # Network
-    nc  = cfg["network"]
+    nc = cfg["network"]
     if cfg["dagger"].get("load_path"):
         print(f"Loading model from {cfg['dagger']['load_path']}")
         pi0 = keras.models.load_model(cfg["dagger"]["load_path"])
@@ -493,7 +458,7 @@ def main(config_path: str = "config_dfs.yaml") -> None:
     if log_dir is not None:
         import datetime
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = os.path.join(log_dir, f"{timestamp}_n{n}_dfs.jsonl")
+        log_path = os.path.join(log_dir, f"{timestamp}_n{n}_astar.jsonl")
         print(f"Progress log → {log_path}")
 
     dagger(
@@ -503,15 +468,12 @@ def main(config_path: str = "config_dfs.yaml") -> None:
         n_iterations=dc["n_iterations"],
         epochs=dc["epochs"],
         batch_size=dc["batch_size"],
-        dfs_max_depth=dc.get("dfs_max_depth", 8),
-        dfs_q=dc.get("dfs_q", 1),
-        dfs_max_breadth=dc.get("dfs_max_breadth"),
+        astar_max_expansions=dc.get("astar_max_expansions", 10000),
         n_trajectories=dc.get("n_trajectories", 1),
         max_dataset_size=dc.get("max_dataset_size"),
         save_path=dc.get("save_path"),
         n_workers=dc.get("n_workers"),
         log_path=log_path,
-        sample_seed=isc.get("sample_seed"),
     )
 
 

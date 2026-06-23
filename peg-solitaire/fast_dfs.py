@@ -6,7 +6,8 @@ Optimizations over dfs.py:
                                          the hot inner loop
   2. In-place numpy mutation (apply/undo) — avoids array copies
   3. Move ordering                     — most-open moves first so the win
-                                         cutoff fires sooner
+                                         cutoff fires sooner (or, when a policy
+                                         network is supplied, by NN likelihood)
   4. Quiescence search                 — extends past the depth limit in
                                          narrow positions (moves <= q)
 
@@ -111,6 +112,41 @@ def _order_moves(arr, frs, ovs, tos, moves) -> list:
     return [(fr, ov, to) for _, fr, ov, to in scored]
 
 
+class _PolicyOrder:
+    """Order moves by the likelihood a policy network assigns to each one.
+
+    The network maps an encoded board (n, n, 2) to logits over action codes
+    (see Board.encode / Board.encode_move). For a given position, every legal
+    move is scored by its logit and the moves are returned highest-first — the
+    NN's analogue of the successor-count heuristic used by `_order_moves`.
+    """
+
+    def __init__(self, model, n: int, inbounds: np.ndarray, directions):
+        self.model = model
+        self.n = n
+        self.inbounds = inbounds.astype(np.float32)
+        self.nd = len(directions)
+        self._dir_index = {d: i for i, d in enumerate(directions)}
+
+    def _encode(self, arr) -> np.ndarray:
+        t = np.zeros((self.n, self.n, 2), dtype=np.float32)
+        t[:, :, 0] = arr
+        t[:, :, 1] = self.inbounds
+        return t[np.newaxis, ...]
+
+    def __call__(self, arr, moves) -> list:
+        logits = self.model(self._encode(arr), training=False)[0].numpy()
+        scored = []
+        for fr, ov, to in moves:
+            r, c = int(fr[0]), int(fr[1])
+            dr = (int(to[0]) - r) // 2
+            dc = (int(to[1]) - c) // 2
+            code = (r * self.n + c) * self.nd + self._dir_index[(dr, dc)]
+            scored.append((float(logits[code]), fr, ov, to))
+        scored.sort(key=lambda s: s[0], reverse=True)
+        return [(fr, ov, to) for _, fr, ov, to in scored]
+
+
 def _limit_breadth(moves, max_breadth) -> list:
     """Keep at most *max_breadth* moves, discarding the rest.
 
@@ -124,7 +160,7 @@ def _limit_breadth(moves, max_breadth) -> list:
 
 # ── recursive DFS ─────────────────────────────────────────────────────────────
 
-def _dfs(arr, frs, ovs, tos, depth: int, q: int, max_breadth) -> int:
+def _dfs(arr, frs, ovs, tos, depth: int, q: int, max_breadth, order) -> int:
     moves = _get_moves(arr, frs, ovs, tos)
     if not moves:
         return int(arr.sum())
@@ -134,11 +170,11 @@ def _dfs(arr, frs, ovs, tos, depth: int, q: int, max_breadth) -> int:
     next_depth = depth - 1 if depth > 0 else 0
     best = int(arr.sum())
 
-    moves = _order_moves(arr, frs, ovs, tos, moves)
+    moves = order(arr, moves)
     moves = _limit_breadth(moves, max_breadth)
     for fr, ov, to in moves:
         _apply(arr, fr, ov, to)
-        result = _dfs(arr, frs, ovs, tos, next_depth, q, max_breadth)
+        result = _dfs(arr, frs, ovs, tos, next_depth, q, max_breadth, order)
         _undo(arr, fr, ov, to)
         if result < best:
             best = result
@@ -155,6 +191,7 @@ def fast_dfs(
     max_depth: int,
     q: int = 1,
     max_breadth: int | None = None,
+    policy=None,
 ) -> tuple | None:
     """
     Search *board* to *max_depth* plies and return the move that minimises
@@ -169,9 +206,14 @@ def fast_dfs(
         q:           Quiescence threshold — at the depth limit, keep searching
                      if available moves <= q (default 1).
         max_breadth: Maximum number of children to expand per node. When a
-                     node has more than *max_breadth* legal moves, the
-                     *max_breadth* moves with the most successors are kept and
-                     the rest are discarded. None (default) expands every child.
+                     node has more than *max_breadth* legal moves, the kept
+                     moves are those the move-ordering heuristic ranks first.
+                     None (default) expands every child.
+        policy:      Optional policy network (keras.Model mapping an encoded
+                     board to action-code logits). When given, moves are
+                     ordered by the likelihood the network assigns to each
+                     move instead of by successor count. This also changes
+                     which moves survive *max_breadth*.
 
     Returns:
         Best (from_pos, over_pos, to_pos) triple, or None if no moves exist.
@@ -187,18 +229,25 @@ def fast_dfs(
     # Warm up JIT.
     _ = _valid_mask(arr, frs, ovs, tos)
 
+    if policy is not None:
+        inbounds = board.encode()[:, :, 1]
+        order = _PolicyOrder(policy, board.n, inbounds, board._DIRECTIONS)
+    else:
+        def order(arr, moves):
+            return _order_moves(arr, frs, ovs, tos, moves)
+
     moves = _get_moves(arr, frs, ovs, tos)
     if not moves:
         return None
 
-    moves = _order_moves(arr, frs, ovs, tos, moves)
+    moves = order(arr, moves)
     moves = _limit_breadth(moves, max_breadth)
 
     best_score = int(arr.sum()) + 1
     best_move = None
     for fr, ov, to in moves:
         _apply(arr, fr, ov, to)
-        score = _dfs(arr, frs, ovs, tos, max_depth - 1, q, max_breadth)
+        score = _dfs(arr, frs, ovs, tos, max_depth - 1, q, max_breadth, order)
         _undo(arr, fr, ov, to)
         if score < best_score:
             best_score = score
