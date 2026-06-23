@@ -10,10 +10,13 @@ the pieces swapped for Lights Out:
    for a state is the *first* press on that path. States the oracle cannot
    improve (an empty path — already solved/best) are skipped.
 
-2. Parallelism lives at the labeling level, not inside the oracle. astar is
-   single-threaded; instead the states of a trajectory are labeled
-   concurrently with a process pool (n_workers). Each astar call works on its
-   own copy of the board, so the calls are independent.
+2. Parallelism lives at the board level, not inside the oracle. astar is
+   single-threaded; instead the work for each initial board (labeling all
+   states from all of that board's rollouts) is dispatched to a separate
+   process in a pool of n_workers. Policy rollouts run in the main process
+   (the keras model stays put); only the A* labeling is parallelized. Each
+   astar call works on its own copy of the board, so the calls are
+   independent.
 
 3. mcts_time_limit / dfs_max_depth → astar_max_expansions.
 
@@ -185,6 +188,19 @@ def _label_state(state, astar_max_expansions):
     return state, move
 
 
+def _label_board(b_idx, states, astar_max_expansions):
+    """Label every state collected for one initial board (top-level → picklable).
+
+    `states` is the concatenation of all states visited across that board's
+    rollouts. Returns (b_idx, results), where results is a list of (state, move)
+    pairs — one per input state — with move possibly None for states the oracle
+    could not improve. Returning b_idx lets the caller attribute results to the
+    board even when board work completes out of order.
+    """
+    results = [_label_state(state, astar_max_expansions) for state in states]
+    return b_idx, results
+
+
 def _collect_trajectories(
     pi: keras.Model,
     initial_boards: list[SquareLightsBoard],
@@ -198,9 +214,10 @@ def _collect_trajectories(
 
     Every board in initial_boards (the set built by build_initial_boards) is used
     as a start: n_trajectories rollouts are generated from each one, for a total of
-    len(initial_boards) * n_trajectories trajectories. astar is single-threaded;
-    the states within a trajectory are labeled concurrently using a pool of
-    n_workers processes.
+    len(initial_boards) * n_trajectories trajectories. Rollouts run sequentially in
+    this process (the policy stays on the main process); the expensive astar
+    labeling is then parallelized across boards — each of the n_workers processes
+    labels all the states belonging to a single board.
     """
     samples: list[tuple[np.ndarray, int]] = []
 
@@ -208,6 +225,8 @@ def _collect_trajectories(
     total_trajectories = n_boards * n_trajectories
     t = 0  # global trajectory counter across all initial boards
 
+    # ── Phase 1: roll out the policy from every board (main process) ───────────
+    board_states: list[list[SquareLightsBoard]] = [[] for _ in range(n_boards)]
     for b_idx, start_board in enumerate(initial_boards):
         for traj_in_board in range(n_trajectories):
             start_lights = start_board.score()
@@ -233,53 +252,60 @@ def _collect_trajectories(
                     traj_time_s=round(traj_time, 3),
                 )
 
-            n_states = len(trajectory)
-            labeled = 0
-            skipped = 0
-            label_start = time.perf_counter()
-
-            results = Parallel(
-                n_jobs=n_workers, backend="loky", return_as="generator_unordered"
-            )(
-                delayed(_label_state)(state, astar_max_expansions)
-                for state in trajectory
-            )
-            for done, (state, move) in enumerate(results, start=1):
-                if move is None:
-                    skipped += 1
-                else:
-                    samples.append((state.encode(), state.encode_move(move)))
-                    labeled += 1
-
-                elapsed_label = time.perf_counter() - label_start
-                rate = done / elapsed_label if elapsed_label > 0 else 0
-                sys.stdout.write(
-                    f"\r  labeling: {done:>{len(str(n_states))}}/{n_states} "
-                    f"({done / n_states * 100:5.1f}%)  {rate:.2f} states/s  "
-                    f"procs={n_workers}     "
-                )
-                sys.stdout.flush()
-
-            label_time = time.perf_counter() - label_start
-            sys.stdout.write("\n")
-
-            print(f"  labeled {labeled}/{n_states} states  "
-                  f"(skipped {skipped})  in {label_time:.1f}s  "
-                  f"avg {label_time / max(n_states, 1):.2f}s/state")
-            if record_fn is not None:
-                record_fn(
-                    type="labeling",
-                    iteration=iteration,
-                    trajectory_idx=t,
-                    board_idx=b_idx,
-                    rollout_idx=traj_in_board,
-                    labeled=labeled,
-                    skipped=skipped,
-                    label_time_s=round(label_time, 3),
-                    rate_states_per_s=round(labeled / label_time if label_time > 0 else 0, 2),
-                )
-
+            board_states[b_idx].extend(trajectory)
             t += 1
+
+    # ── Phase 2: label each board's states, parallelized across boards ─────────
+    total_states = sum(len(s) for s in board_states)
+    boards_done = 0
+    states_done = 0
+    label_start = time.perf_counter()
+
+    results = Parallel(
+        n_jobs=n_workers, backend="loky", return_as="generator_unordered"
+    )(
+        delayed(_label_board)(b_idx, states, astar_max_expansions)
+        for b_idx, states in enumerate(board_states)
+    )
+    for b_idx, board_results in results:
+        labeled = 0
+        skipped = 0
+        for state, move in board_results:
+            if move is None:
+                skipped += 1
+            else:
+                samples.append((state.encode(), state.encode_move(move)))
+                labeled += 1
+
+        boards_done += 1
+        states_done += len(board_results)
+        elapsed_label = time.perf_counter() - label_start
+        rate = states_done / elapsed_label if elapsed_label > 0 else 0
+        print(f"  [board {b_idx + 1}/{n_boards}]  labeled {labeled}/{len(board_results)} "
+              f"states (skipped {skipped})  |  {boards_done}/{n_boards} boards, "
+              f"{states_done}/{total_states} states  {rate:.2f} states/s  "
+              f"procs={n_workers}")
+        if record_fn is not None:
+            record_fn(
+                type="labeling",
+                iteration=iteration,
+                board_idx=b_idx,
+                labeled=labeled,
+                skipped=skipped,
+                states=len(board_results),
+            )
+
+    label_time = time.perf_counter() - label_start
+    print(f"  labeled {total_states} state(s) across {n_boards} board(s) in "
+          f"{label_time:.1f}s  avg {label_time / max(total_states, 1):.2f}s/state")
+    if record_fn is not None:
+        record_fn(
+            type="labeling_summary",
+            iteration=iteration,
+            total_states=total_states,
+            label_time_s=round(label_time, 3),
+            rate_states_per_s=round(total_states / label_time if label_time > 0 else 0, 2),
+        )
 
     return samples
 
