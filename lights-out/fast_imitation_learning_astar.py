@@ -10,13 +10,14 @@ the pieces swapped for Lights Out:
    for a state is the *first* press on that path. States the oracle cannot
    improve (an empty path — already solved/best) are skipped.
 
-2. Parallelism lives at the board level, not inside the oracle. astar is
-   single-threaded; instead all the work for each initial board — generating
-   that board's policy rollouts *and* labeling every visited state with A* — is
-   dispatched as one task to a separate process in a pool of n_workers. The
-   policy model is saved once per collection round and lazily loaded (and
-   cached) inside each worker, so rollouts and labeling for a board happen
-   together in the same process. Each board's work is fully independent.
+2. Collection runs in two phases. First every initial board's policy rollouts
+   are generated sequentially in the main process (using the in-memory policy),
+   producing a flat list of every visited state. Then all of those states are
+   labeled with the A* oracle in a single parallel pass across n_workers
+   processes — one labeling task per state. astar is single-threaded, so the
+   parallelism is purely across states; because A* cost varies a lot from state
+   to state, per-state dispatch load-balances better than per-board. Labeling
+   needs no policy model, so nothing is serialized to disk.
 
 3. mcts_time_limit / dfs_max_depth → astar_max_expansions.
 
@@ -31,17 +32,15 @@ from __future__ import annotations
 import json
 import os
 import random
-import shutil
 import sys
-import tempfile
 import time
+from collections import defaultdict
 from joblib import Parallel, delayed
 import numpy as np
 import keras
 
 from board import SquareLightsBoard
 from astar import astar
-from policy_network_square import select_action
 
 
 # ── JSONL progress logging ────────────────────────────────────────────────────
@@ -108,22 +107,63 @@ def learn(
 
 # ── Trajectory generation ─────────────────────────────────────────────────────
 
-def _gen_trajectory(
-    policy: keras.Model, board: SquareLightsBoard
-) -> tuple[list[SquareLightsBoard], SquareLightsBoard]:
-    """Roll out policy from board; return (states visited, terminal board).
+def _gen_trajectories_batched(
+    policy: keras.Model,
+    lane_specs: list[tuple[int, int, SquareLightsBoard]],
+    gen_start: float,
+) -> list[dict]:
+    """Roll out many trajectories concurrently with one batched forward pass/step.
 
-    Presses are sampled from the policy until the board is over — either solved
-    (no lights remain) or every cell has been pressed (no legal moves left).
-    The trajectory is bounded by n² steps.
+    Each entry in lane_specs is (board_idx, rollout_idx, start_board) describing
+    one independent rollout ("lane"). All lanes advance in lockstep: at every
+    step the still-active lanes are stacked into a single (A, n, n, 2) batch and
+    scored with one policy call, then each lane samples a legal press (the same
+    masked-softmax sampling as the original per-board rollout) and applies it.
+    Lanes drop out as they finish; because each press is a distinct cell, every
+    lane is over within n² steps.
+
+    Returns one dict per lane: board_idx, rollout_idx, start_lights, states
+    (the visited pre-press boards, in order), the terminal board, and the
+    wall-clock time (relative to gen_start) at which that lane finished.
     """
-    states: list[SquareLightsBoard] = []
-    b = board.copy()
-    while not b.is_over():
-        states.append(b.copy())
-        move = select_action(policy, b, greedy=False)
-        b.apply(move)
-    return states, b
+    lanes: list[dict] = [
+        {
+            "board_idx": b_idx,
+            "rollout_idx": rollout_idx,
+            "board": start_board.copy(),
+            "start_lights": start_board.score(),
+            "states": [],
+            "traj_time_s": 0.0,
+        }
+        for b_idx, rollout_idx, start_board in lane_specs
+    ]
+
+    active = [ln for ln in lanes if not ln["board"].is_over()]
+    while active:
+        batch = np.stack([ln["board"].encode() for ln in active])  # (A, n, n, 2)
+        logits = policy(batch, training=False).numpy()             # (A, n*n)
+
+        still_active = []
+        for ln, lane_logits in zip(active, logits):
+            b = ln["board"]
+            ln["states"].append(b.copy())
+
+            legal_moves = b.available_moves()
+            legal_codes = [b.encode_move(m) for m in legal_moves]
+            legal_logits = lane_logits[legal_codes]
+            legal_logits = legal_logits - legal_logits.max()  # numerical stability
+            probs = np.exp(legal_logits)
+            probs /= probs.sum()
+            idx = int(np.random.choice(len(legal_moves), p=probs))
+            b.apply(legal_moves[idx])
+
+            if b.is_over():
+                ln["traj_time_s"] = time.perf_counter() - gen_start
+            else:
+                still_active.append(ln)
+        active = still_active
+
+    return lanes
 
 
 # ── Initial-board set construction ─────────────────────────────────────────────
@@ -190,58 +230,6 @@ def _label_state(state, astar_max_expansions):
     return state, move
 
 
-# Per-worker policy-model cache. Each loky worker loads the model from disk on
-# its first board and reuses it for every subsequent board, so the (expensive)
-# load happens at most once per process rather than once per board.
-_WORKER_MODEL_CACHE: dict[str, keras.Model] = {}
-
-
-def _get_worker_model(model_path: str) -> keras.Model:
-    model = _WORKER_MODEL_CACHE.get(model_path)
-    if model is None:
-        model = keras.models.load_model(model_path)
-        _WORKER_MODEL_CACHE[model_path] = model
-    return model
-
-
-def _process_board(b_idx, start_board, n_trajectories, model_path, astar_max_expansions):
-    """Roll out and label every state for one initial board (top-level → picklable).
-
-    Runs entirely inside a worker process: it loads the policy model (cached per
-    process), generates n_trajectories rollouts from start_board, and labels
-    every visited state with the A* oracle's first press.
-
-    Returns (b_idx, results, traj_meta) where:
-      - results   is a list of (state, move) pairs — one per visited state —
-                  with move possibly None for states the oracle could not improve;
-      - traj_meta is a list of per-rollout dicts (start_lights, steps,
-                  lights_remaining, traj_time_s) for logging.
-    Returning b_idx lets the caller attribute results to the board even when
-    board work completes out of order.
-    """
-    model = _get_worker_model(model_path)
-    results: list[tuple[SquareLightsBoard, object]] = []
-    traj_meta: list[dict] = []
-
-    for _ in range(n_trajectories):
-        start_lights = start_board.score()
-        traj_start = time.perf_counter()
-        trajectory, final_board = _gen_trajectory(model, start_board)
-        traj_time = time.perf_counter() - traj_start
-
-        for state in trajectory:
-            results.append(_label_state(state, astar_max_expansions))
-
-        traj_meta.append({
-            "start_lights": start_lights,
-            "steps": len(trajectory),
-            "lights_remaining": final_board.score(),
-            "traj_time_s": round(traj_time, 3),
-        })
-
-    return b_idx, results, traj_meta
-
-
 def _collect_trajectories(
     pi: keras.Model,
     initial_boards: list[SquareLightsBoard],
@@ -251,95 +239,113 @@ def _collect_trajectories(
     record_fn=None,
     iteration: int | None = None,
 ) -> list[tuple[np.ndarray, int]]:
-    """Roll out and label n_trajectories from every initial board; return samples.
+    """Roll out every initial board, then label every visited state; return samples.
 
-    Every board in initial_boards (the set built by build_initial_boards) is used
-    as a start: n_trajectories rollouts are generated from each one, for a total of
-    len(initial_boards) * n_trajectories trajectories. Rollout generation and A*
-    labeling are fused into a single per-board task and parallelized across
-    n_workers processes — each process handles one board's rollouts and labels
-    all the states it visits. The policy model is saved to a temp file once and
-    lazily loaded inside each worker (see _process_board / _get_worker_model).
+    Runs in two phases:
+
+      1. Generation — every board in initial_boards (the set built by
+         build_initial_boards) is rolled out n_trajectories times in the main
+         process using the in-memory policy, for a total of
+         len(initial_boards) * n_trajectories trajectories. Every visited state
+         is collected into a single flat list.
+
+      2. Labeling — all collected states are labeled with the A* oracle in one
+         parallel pass across n_workers processes (one task per state). Labeling
+         needs no policy model, so nothing is serialized to disk.
     """
-    samples: list[tuple[np.ndarray, int]] = []
-
     n_boards = len(initial_boards)
     total_trajectories = n_boards * n_trajectories
 
-    # Persist the current policy so workers can load it (the keras model itself
-    # is awkward to pickle per-task; a shared on-disk copy is loaded once per
-    # worker and cached). Removed once collection finishes.
-    model_dir = tempfile.mkdtemp(prefix="fast_il_astar_model_")
-    model_path = os.path.join(model_dir, "policy.keras")
-    pi.save(model_path)
+    # ── Phase 1: generate every trajectory (batched rollouts, main process) ──
+    # All boards × rollouts advance in lockstep so each step is a single batched
+    # policy forward pass rather than one batch-of-1 call per board per step.
+    gen_start = time.perf_counter()
+    states: list[SquareLightsBoard] = []   # flat list of every visited state
+    state_board: list[int] = []            # board index per state (for logging)
 
-    boards_done = 0
-    states_done = 0
-    trajectories_done = 0
-    work_start = time.perf_counter()
+    lane_specs = [
+        (b_idx, rollout_idx, start_board)
+        for b_idx, start_board in enumerate(initial_boards)
+        for rollout_idx in range(n_trajectories)
+    ]
+    lanes = _gen_trajectories_batched(pi, lane_specs, gen_start)
 
-    try:
-        results = Parallel(
-            n_jobs=n_workers, backend="loky", return_as="generator_unordered"
-        )(
-            delayed(_process_board)(
-                b_idx, start_board, n_trajectories, model_path, astar_max_expansions
+    # lane_specs is board-major, so flattening lanes preserves board order.
+    for ln in lanes:
+        states.extend(ln["states"])
+        state_board.extend(ln["board_idx"] for _ in ln["states"])
+
+        if record_fn is not None:
+            record_fn(
+                type="trajectory",
+                iteration=iteration,
+                board_idx=ln["board_idx"],
+                rollout_idx=ln["rollout_idx"],
+                start_lights=ln["start_lights"],
+                steps=len(ln["states"]),
+                lights_remaining=ln["board"].score(),
+                traj_time_s=round(ln["traj_time_s"], 3),
             )
-            for b_idx, start_board in enumerate(initial_boards)
-        )
-        for b_idx, board_results, traj_meta in results:
-            labeled = 0
-            skipped = 0
-            for state, move in board_results:
-                if move is None:
-                    skipped += 1
-                else:
-                    samples.append((state.encode(), state.encode_move(move)))
-                    labeled += 1
 
-            boards_done += 1
-            states_done += len(board_results)
-            trajectories_done += len(traj_meta)
+    gen_time = time.perf_counter() - gen_start
+    print(f"  generated {total_trajectories} trajectory(ies) across {n_boards} board(s) "
+          f"→ {len(states)} state(s) in {gen_time:.1f}s")
 
-            for rollout_idx, meta in enumerate(traj_meta):
-                if record_fn is not None:
-                    record_fn(
-                        type="trajectory",
-                        iteration=iteration,
-                        board_idx=b_idx,
-                        rollout_idx=rollout_idx,
-                        **meta,
-                    )
+    # ── Phase 2: label every state in parallel (one task per state) ──
+    label_start = time.perf_counter()
+    labeled_results = Parallel(
+        n_jobs=n_workers, backend="loky", return_as="generator"
+    )(
+        delayed(_label_state)(state, astar_max_expansions) for state in states
+    )
 
-            elapsed = time.perf_counter() - work_start
-            rate = states_done / elapsed if elapsed > 0 else 0
-            print(f"  [board {b_idx + 1}/{n_boards}]  {len(traj_meta)} rollout(s), "
-                  f"labeled {labeled}/{len(board_results)} states (skipped {skipped})  |  "
-                  f"{boards_done}/{n_boards} boards, {trajectories_done}/{total_trajectories} "
-                  f"trajectories, {states_done} states  {rate:.2f} states/s  procs={n_workers}")
-            if record_fn is not None:
-                record_fn(
-                    type="labeling",
-                    iteration=iteration,
-                    board_idx=b_idx,
-                    labeled=labeled,
-                    skipped=skipped,
-                    states=len(board_results),
-                )
-    finally:
-        shutil.rmtree(model_dir, ignore_errors=True)
+    # return_as="generator" preserves input order, so results line up with
+    # state_board and can be attributed back to each board.
+    samples: list[tuple[np.ndarray, int]] = []
+    per_board: dict[int, dict[str, int]] = defaultdict(
+        lambda: {"labeled": 0, "skipped": 0, "states": 0}
+    )
+    for b_idx, (state, move) in zip(state_board, labeled_results):
+        pb = per_board[b_idx]
+        pb["states"] += 1
+        if move is None:
+            pb["skipped"] += 1
+        else:
+            samples.append((state.encode(), state.encode_move(move)))
+            pb["labeled"] += 1
 
-    total_states = states_done
-    work_time = time.perf_counter() - work_start
+    states_done = 0
+    label_time = time.perf_counter() - label_start
+    for b_idx in range(n_boards):
+        pb = per_board[b_idx]
+        states_done += pb["states"]
+        rate = states_done / label_time if label_time > 0 else 0
+        print(f"  [board {b_idx + 1}/{n_boards}]  "
+              f"labeled {pb['labeled']}/{pb['states']} states (skipped {pb['skipped']})  |  "
+              f"{states_done}/{len(states)} states labeled  {rate:.2f} states/s  procs={n_workers}")
+        if record_fn is not None:
+            record_fn(
+                type="labeling",
+                iteration=iteration,
+                board_idx=b_idx,
+                labeled=pb["labeled"],
+                skipped=pb["skipped"],
+                states=pb["states"],
+            )
+
+    total_states = len(states)
     print(f"  rolled out & labeled {total_states} state(s) across {n_boards} board(s) in "
-          f"{work_time:.1f}s  avg {work_time / max(total_states, 1):.2f}s/state")
+          f"{gen_time + label_time:.1f}s "
+          f"(gen {gen_time:.1f}s, label {label_time:.1f}s)  "
+          f"avg {label_time / max(total_states, 1):.2f}s/state")
     if record_fn is not None:
         record_fn(
             type="labeling_summary",
             iteration=iteration,
             total_states=total_states,
-            label_time_s=round(work_time, 3),
-            rate_states_per_s=round(total_states / work_time if work_time > 0 else 0, 2),
+            gen_time_s=round(gen_time, 3),
+            label_time_s=round(label_time, 3),
+            rate_states_per_s=round(total_states / label_time if label_time > 0 else 0, 2),
         )
 
     return samples
