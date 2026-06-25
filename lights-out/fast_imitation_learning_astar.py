@@ -376,7 +376,8 @@ def dagger(
     n_trajectories: int = 1,
     max_trajectory_length: int | None = None,
     max_dataset_size: int | None = None,
-    save_path: str | None = "policy_model.keras",
+    checkpoint_dir: str | None = "checkpoints",
+    model_name: str = "policy_model",
     n_workers: int | None = None,
     log_path: str | None = None,
 ) -> keras.Model:
@@ -397,7 +398,11 @@ def dagger(
                                a lane is cut off once it reaches this many states
                                even if unsolved; None → no limit
     max_dataset_size         — cap on dataset length; oldest samples evicted first; None → unlimited
-    save_path                — save model after each iteration; None disables saving
+    checkpoint_dir           — directory in which a distinct per-iteration model
+                               checkpoint is saved after each iteration; None
+                               disables per-iteration checkpointing
+    model_name               — base name for the per-iteration checkpoint files
+                               (saved as <model_name>_iter<NNNN>.keras)
     n_workers                — number of processes for concurrent per-board
                                rollout generation and state labeling
     log_path                 — JSONL file for progress logging; None disables logging
@@ -405,6 +410,9 @@ def dagger(
     Returns the final updated policy.
     """
     n_workers = n_workers or (os.cpu_count() or 1)
+
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
     _ensure_jit_compiled(pi0, optimizer)
 
@@ -461,9 +469,12 @@ def dagger(
         pi = learn(D, pi, optimizer, epochs, batch_size, record_fn=record, iteration=i + 1)
         train_time = time.perf_counter() - train_start
 
-        if save_path:
-            pi.save(save_path)
-            print(f"  model saved → {save_path}")
+        if checkpoint_dir:
+            checkpoint_path = os.path.join(
+                checkpoint_dir, f"{model_name}_iter{i + 1:04d}.keras"
+            )
+            pi.save(checkpoint_path)
+            print(f"  checkpoint saved → {checkpoint_path}")
 
         iter_time = time.perf_counter() - iter_start
         print(f"\n  iteration {i+1} complete in {iter_time:.1f}s")
@@ -560,7 +571,8 @@ def main(config_path: str = "config_astar.yaml") -> None:
         n_trajectories=dc.get("n_trajectories", 1),
         max_trajectory_length=dc.get("max_trajectory_length"),
         max_dataset_size=dc.get("max_dataset_size"),
-        save_path=dc.get("save_path"),
+        checkpoint_dir=dc.get("checkpoint_dir", "checkpoints"),
+        model_name=dc.get("model_name", "policy_model"),
         n_workers=dc.get("n_workers"),
         log_path=log_path,
     )
