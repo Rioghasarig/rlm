@@ -38,6 +38,7 @@ from collections import defaultdict
 from joblib import Parallel, delayed
 import numpy as np
 import keras
+from tqdm import tqdm
 
 from board import SquareLightsBoard
 from astar import astar
@@ -313,7 +314,12 @@ def _collect_trajectories(
     per_board: dict[int, dict[str, int]] = defaultdict(
         lambda: {"labeled": 0, "skipped": 0, "states": 0}
     )
-    for b_idx, (state, move) in zip(state_board, labeled_results):
+    for b_idx, (state, move) in tqdm(
+        zip(state_board, labeled_results),
+        total=len(states),
+        desc="Labeling states",
+        unit="state",
+    ):
         pb = per_board[b_idx]
         pb["states"] += 1
         if move is None:

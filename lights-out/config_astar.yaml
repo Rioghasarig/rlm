@@ -16,7 +16,7 @@ dagger:
   n_iterations: 50              # DAgger outer iterations
   epochs: 10                    # supervised-learning epochs per iteration
   batch_size: 128               # mini-batch size for learn()
-  astar_max_expansions: 1000    # node-expansion budget for the astar teacher; null → search until solved/exhausted
+  astar_max_expansions: 100    # node-expansion budget for the astar teacher; null → search until solved/exhausted
   n_trajectories: 5             # policy rollouts collected per initial board per iteration
   max_trajectory_length: 20     # cap on states collected per rollout; lane cut off once reached; null → no limit
   max_dataset_size: 5000        # oldest samples evicted when exceeded; null → unlimited
