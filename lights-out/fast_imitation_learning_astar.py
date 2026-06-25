@@ -333,10 +333,7 @@ def _collect_trajectories(
     for b_idx in range(n_boards):
         pb = per_board[b_idx]
         states_done += pb["states"]
-        rate = states_done / label_time if label_time > 0 else 0
-        print(f"  [board {b_idx + 1}/{n_boards}]  "
-              f"labeled {pb['labeled']}/{pb['states']} states (skipped {pb['skipped']})  |  "
-              f"{states_done}/{len(states)} states labeled  {rate:.2f} states/s  procs={n_workers}")
+
         if record_fn is not None:
             record_fn(
                 type="labeling",
