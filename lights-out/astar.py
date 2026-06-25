@@ -17,9 +17,16 @@ Because presses commute and are self-inverse, the *set* of pressed cells fully
 determines the resulting position, so states are deduplicated by that set: all
 orderings of the same presses collapse to a single node.
 
+The search still explores full paths internally, but only the *first* move of
+the best path is returned — the single move to play next from `board`. This
+matches how the result is consumed (one move per state, re-queried after each
+step). The result is always an actionable move: a cell press when some press
+reduces the lights, otherwise the "stop" sentinel (``board.STOP``) — including
+when the board is already solved, where stopping locks in the win.
+
 Public API
 ----------
-astar(board, max_expansions, policy) -> list[move]   # presses to the best state
+astar(board, max_expansions, policy) -> move   # next move (a press or STOP)
 """
 from __future__ import annotations
 
@@ -57,16 +64,19 @@ def astar(
     board: Board,
     max_expansions: int | None = None,
     policy=None,
-) -> list:
-    """Search *board* for a sequence of presses that turns off as many lights
-    as possible (ideally all of them).
+):
+    """Search *board* for the best next move toward turning off every light.
+
+    Internally the search explores full paths to find the state with the fewest
+    lights remaining; only the *first* move of that best path is returned — the
+    single move to play next from *board*.
 
     Args:
         board:          Starting board (not mutated).
-        max_expansions: Stop after this many nodes have been expanded and
-                        return the best solution found so far. None (default)
-                        searches until the open set is exhausted or a full
-                        solution (0 lights) is found.
+        max_expansions: Stop after this many nodes have been expanded and use
+                        the best solution found so far. None (default) searches
+                        until the open set is exhausted or a full solution (0
+                        lights) is found.
         policy:         Optional trained policy model (e.g. from
                         ``build_square_policy_network``). When given, children
                         are prioritised by the policy's negative log-likelihood
@@ -75,17 +85,21 @@ def astar(
                         is plain lights-remaining A*.
 
     Returns:
-        The list of moves (cell presses) leading to the state with the fewest
-        lights remaining that was found. Empty if the start is already the best
-        state seen (e.g. already solved).
+        The best next move — always actionable, never "do nothing":
+
+        * a cell press ``(row, col)`` when some press improves on the board;
+        * ``board.STOP`` otherwise — when no press reduces the lights (stop
+          rather than waste presses), or the board is already solved (stop to
+          lock in the win).
     """
     start = board.copy()
 
     # Best (fewest-lights) state found so far, and the path that reaches it.
+    # When nothing improves the board, the right move is to stop.
     best_score = start.score()
     best_path: list = []
     if start.is_won():
-        return best_path
+        return start.STOP
 
     # A unique sequence number keeps heap entries from ever comparing boards
     # when their f-values tie.
@@ -102,9 +116,10 @@ def astar(
             continue
         visited.add(key)
 
-        # h = 0: every light is off — this is the best possible outcome.
+        # h = 0: every light is off — this is the best possible outcome, so the
+        # first press on the path that reaches it is the best next move.
         if node.is_won():
-            return path
+            return path[0] if path else node.STOP
 
         if max_expansions is not None and expansions >= max_expansions:
             break
@@ -129,4 +144,8 @@ def astar(
             priority = -log_probs[move] if log_probs is not None else child_score
             heapq.heappush(open_heap, (priority, next(counter), child, child_path))
 
-    return best_path
+    # A press improves on the start: play the first one toward the best state.
+    # Otherwise nothing helps — stop here rather than waste a press.
+    if best_path:
+        return best_path[0]
+    return start.STOP

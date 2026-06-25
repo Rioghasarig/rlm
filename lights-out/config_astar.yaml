@@ -1,8 +1,8 @@
 board:
-  n: 5                          # board side length (n×n grid)
+  n: 8                          # board side length (n×n grid)
   init_set:                     # set of starting boards built with SquareLightsBoard.scramble
-    num_boards: 30              # number of distinct random solvable boards to generate
-    scramble_k: 10              # random presses applied to the all-off state to scramble each board
+    num_boards: 100             # number of distinct random solvable boards to generate
+    scramble_k: 20              # random presses applied to the all-off state to scramble each board
     seed: null                  # RNG seed for reproducible board-set construction; null → nondeterministic
 
 network:
@@ -16,8 +16,9 @@ dagger:
   n_iterations: 50              # DAgger outer iterations
   epochs: 10                    # supervised-learning epochs per iteration
   batch_size: 128               # mini-batch size for learn()
-  astar_max_expansions: 10000   # node-expansion budget for the astar teacher; null → search until solved/exhausted
-  n_trajectories: 2             # policy rollouts collected per initial board per iteration
+  astar_max_expansions: 1000    # node-expansion budget for the astar teacher; null → search until solved/exhausted
+  n_trajectories: 5             # policy rollouts collected per initial board per iteration
+  max_trajectory_length: 20     # cap on states collected per rollout; lane cut off once reached; null → no limit
   max_dataset_size: 5000        # oldest samples evicted when exceeded; null → unlimited
   save_path: policy_model_astar.keras  # checkpoint path; set to null to disable
   load_path: null               # resume from this .keras file; null → fresh model

@@ -30,23 +30,27 @@ from astar import astar
 
 
 def evaluate(board: SquareLightsBoard, max_expansions: int) -> dict:
-    """Run A* on a copy of *board* and report how it did.
+    """Greedily follow A* on a copy of *board* and report how it did.
 
-    Returns a dict with the starting score, the score reached, the number of
-    lights cleared, whether the board was fully solved, the solution length
-    (number of presses), and the wall-clock time taken.
+    astar returns a single best next move, so we apply it and re-query until it
+    says STOP (or the board is solved). Returns a dict with the starting score,
+    the score reached, the number of lights cleared, whether the board was fully
+    solved, the solution length (number of presses made), and the wall-clock
+    time taken for the whole rollout.
     """
     start_score = board.score()
-    work = board.copy()
 
+    final = board.copy()
     t0 = time.perf_counter()
-    moves = astar(work, max_expansions=max_expansions)
+    n_presses = 0
+    while True:
+        move = astar(final, max_expansions=max_expansions)
+        if move == SquareLightsBoard.STOP:
+            break
+        final.apply(move)
+        n_presses += 1
     elapsed = time.perf_counter() - t0
 
-    # Replay the returned presses to find the score they actually reach.
-    final = board.copy()
-    for move in moves:
-        final.apply(move)
     final_score = final.score()
 
     return {
@@ -54,7 +58,7 @@ def evaluate(board: SquareLightsBoard, max_expansions: int) -> dict:
         "final_score": final_score,
         "cleared": start_score - final_score,
         "solved": final.is_won(),
-        "solution_length": len(moves),
+        "solution_length": n_presses,
         "time_s": elapsed,
     }
 

@@ -5,10 +5,10 @@ using A* as the labeling teacher.
 This mirrors fast_imitation_learning_dfs.py from the peg-solitaire project, with
 the pieces swapped for Lights Out:
 
-1. astar replaces fast_dfs as the labeling oracle. astar returns a full
-   solution path (a *list* of presses) from a given state; the imitation label
-   for a state is the *first* press on that path. States the oracle cannot
-   improve (an empty path — already solved/best) are skipped.
+1. astar replaces fast_dfs as the labeling oracle. astar returns the single best
+   next move from a given state — a cell press when one improves the board, or
+   STOP when nothing does (the right action being to end the game). That move is
+   the imitation label directly; it is always actionable, so no state is skipped.
 
 2. Collection runs in two phases. First every initial board's policy rollouts
    are generated sequentially in the main process (using the in-memory policy),
@@ -111,6 +111,7 @@ def _gen_trajectories_batched(
     policy: keras.Model,
     lane_specs: list[tuple[int, int, SquareLightsBoard]],
     gen_start: float,
+    max_trajectory_length: int | None = None,
 ) -> list[dict]:
     """Roll out many trajectories concurrently with one batched forward pass/step.
 
@@ -121,6 +122,10 @@ def _gen_trajectories_batched(
     masked-softmax sampling as the original per-board rollout) and applies it.
     Lanes drop out as they finish; because each press is a distinct cell, every
     lane is over within n² steps.
+
+    If max_trajectory_length is given, a lane is also cut off once it has
+    collected that many states, even if the board is not yet solved (None → no
+    limit).
 
     Returns one dict per lane: board_idx, rollout_idx, start_lights, states
     (the visited pre-press boards, in order), the terminal board, and the
@@ -156,8 +161,11 @@ def _gen_trajectories_batched(
             probs /= probs.sum()
             idx = int(np.random.choice(len(legal_moves), p=probs))
             b.apply(legal_moves[idx])
-
-            if b.is_over():
+            reached_limit = (
+                max_trajectory_length is not None
+                and len(ln["states"]) >= max_trajectory_length
+            )
+            if b.is_over() or reached_limit:
                 ln["traj_time_s"] = time.perf_counter() - gen_start
             else:
                 still_active.append(ln)
@@ -218,15 +226,14 @@ def build_initial_boards(
 # ── DAgger ────────────────────────────────────────────────────────────────────
 
 def _label_state(state, astar_max_expansions):
-    """Label a single state with the oracle's first press (top-level → picklable).
+    """Label a single state with the oracle's best next move (top-level → picklable).
 
-    astar returns the full press path to the best state it finds. The imitation
-    label is the *first* press on that path. An empty path means the oracle could
-    not improve on the state (e.g. already solved); such states return None and
-    are skipped during collection.
+    astar returns the single move to play next from *state* — a cell press when
+    some press improves it, or STOP when nothing does (including an already-solved
+    board). The label is that move directly; it is always actionable, so no state
+    is skipped during collection.
     """
-    path = astar(state, max_expansions=astar_max_expansions)
-    move = path[0] if path else None
+    move = astar(state, max_expansions=astar_max_expansions)
     return state, move
 
 
@@ -238,6 +245,7 @@ def _collect_trajectories(
     n_workers: int,
     record_fn=None,
     iteration: int | None = None,
+    max_trajectory_length: int | None = None,
 ) -> list[tuple[np.ndarray, int]]:
     """Roll out every initial board, then label every visited state; return samples.
 
@@ -268,7 +276,7 @@ def _collect_trajectories(
         for b_idx, start_board in enumerate(initial_boards)
         for rollout_idx in range(n_trajectories)
     ]
-    lanes = _gen_trajectories_batched(pi, lane_specs, gen_start)
+    lanes = _gen_trajectories_batched(pi, lane_specs, gen_start, max_trajectory_length)
 
     # lane_specs is board-major, so flattening lanes preserves board order.
     for ln in lanes:
@@ -360,6 +368,7 @@ def dagger(
     batch_size: int,
     astar_max_expansions: int | None = 10000,
     n_trajectories: int = 1,
+    max_trajectory_length: int | None = None,
     max_dataset_size: int | None = None,
     save_path: str | None = "policy_model.keras",
     n_workers: int | None = None,
@@ -378,6 +387,9 @@ def dagger(
                                None → search until solved or exhausted
     n_trajectories           — rollouts per initial board per iteration; total
                                trajectories = len(initial_boards) * n_trajectories
+    max_trajectory_length    — cap on the number of states collected per rollout;
+                               a lane is cut off once it reaches this many states
+                               even if unsolved; None → no limit
     max_dataset_size         — cap on dataset length; oldest samples evicted first; None → unlimited
     save_path                — save model after each iteration; None disables saving
     n_workers                — number of processes for concurrent per-board
@@ -407,6 +419,7 @@ def dagger(
         type="run_start",
         n_iterations=n_iterations,
         n_trajectories=n_trajectories,
+        max_trajectory_length=max_trajectory_length,
         epochs=epochs,
         batch_size=batch_size,
         astar_max_expansions=astar_max_expansions,
@@ -432,6 +445,7 @@ def dagger(
             pi, initial_boards, n_trajectories,
             astar_max_expansions, n_workers,
             record_fn=record, iteration=i + 1,
+            max_trajectory_length=max_trajectory_length,
         )
         _append_samples(D, new_samples_list)
 
@@ -538,6 +552,7 @@ def main(config_path: str = "config_astar.yaml") -> None:
         batch_size=dc["batch_size"],
         astar_max_expansions=dc.get("astar_max_expansions", 10000),
         n_trajectories=dc.get("n_trajectories", 1),
+        max_trajectory_length=dc.get("max_trajectory_length"),
         max_dataset_size=dc.get("max_dataset_size"),
         save_path=dc.get("save_path"),
         n_workers=dc.get("n_workers"),

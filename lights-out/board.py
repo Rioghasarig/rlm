@@ -70,18 +70,28 @@ class SquareLightsBoard(Board):
     specify an arbitrary configuration, or use `SquareLightsBoard.scramble` to
     generate a random *solvable* board.
 
+    A special "stop" move is always available while ordinary presses remain.
+    It does not change the board; instead it ends the game immediately,
+    leaving any remaining lights on as the final score. This lets a player (or
+    policy) bail out when no further press would help.
+
     Action codes:
         0 … n²-1  press cell (r, c), code = r·n + c
+        n²        stop (end the game, board unchanged)
     """
 
     # The press stencil: the cell itself plus its four orthogonal neighbours.
     _STENCIL = [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)]
+
+    # Sentinel "stop" move: ends the game without touching the board.
+    STOP = (-1, -1)
 
     def __init__(self, n: int, lights: set[tuple[int, int]] | None = None):
         if n < 2:
             raise ValueError("Board size must be at least 2")
         self.n = n
         self.pressed = set()
+        self.stopped = False
         if lights is None:
             # Classic starting position: every light on.
             self.lights = {
@@ -130,16 +140,33 @@ class SquareLightsBoard(Board):
                 self.lights.add(cell)
 
     def available_moves(self) -> list[tuple[int, int]]:
+        # Once stopped, the game is over and nothing is legal.
+        if self.stopped:
+            return []
         # Every in-bounds, not-yet-pressed cell is a legal press.
-        return [
+        presses = [
             (row, col)
             for row in range(self.n)
             for col in range(self.n)
             if self._in_bounds(row, col) and (row, col) not in self.pressed
         ]
+        # Offer "stop" only while there is still something to press, so a board
+        # with no presses left still terminates on its own.
+        if presses:
+            presses.append(self.STOP)
+        return presses
 
     def apply(self, move: tuple[int, int]) -> None:
-        """Press a cell: toggle its stencil and record the press."""
+        """Press a cell, or end the game with the "stop" move.
+
+        The "stop" move (``SquareLightsBoard.STOP``) leaves the board unchanged
+        and ends the game immediately; any remaining lights stay on.
+        """
+        if move == self.STOP:
+            if self.stopped:
+                raise ValueError("Game has already been stopped")
+            self.stopped = True
+            return
         r, c = move
         if not self._in_bounds(r, c):
             raise ValueError(f"Press {move} is out of bounds")
@@ -163,6 +190,7 @@ class SquareLightsBoard(Board):
         b.n = self.n
         b.lights = self.lights.copy()
         b.pressed = self.pressed.copy()
+        b.stopped = self.stopped
         return b
 
     def encode(self) -> np.ndarray:
@@ -183,10 +211,14 @@ class SquareLightsBoard(Board):
         return t
 
     def encode_move(self, move: tuple[int, int]) -> int:
+        if move == self.STOP:
+            return self.n * self.n
         r, c = move
         return r * self.n + c
 
     def decode_move(self, code: int) -> tuple[int, int]:
+        if code == self.n * self.n:
+            return self.STOP
         return divmod(code, self.n)
 
     def __repr__(self) -> str:

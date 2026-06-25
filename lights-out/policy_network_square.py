@@ -21,10 +21,11 @@ def build_square_policy_network(n: int, res_blocks: int = 4, filters: int = 64) 
 
     Input shape:  (batch, n, n, 2)  — board.encode() with a batch axis
                   (channel 0 = lights, channel 1 = in-bounds mask)
-    Output shape: (batch, n*n)       — raw logits over encode_move action codes
-                  (one logit per cell press, code = row*n + col)
+    Output shape: (batch, n*n + 1)   — raw logits over encode_move action codes
+                  (one logit per cell press, code = row*n + col, plus a final
+                  logit at code n*n for the STOP action)
     """
-    action_size = n * n
+    action_size = n * n + 1
 
     inp = keras.Input(shape=(n, n, 2), name='board')
 
