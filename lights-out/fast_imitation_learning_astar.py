@@ -367,11 +367,14 @@ def _collect_trajectories(
 
 def dagger(
     pi0: keras.Model,
-    initial_boards: list[SquareLightsBoard],
     optimizer: keras.optimizers.Optimizer,
     n_iterations: int,
     epochs: int,
     batch_size: int,
+    board_n: int,
+    num_boards: int = 30,
+    scramble_k: int = 10,
+    board_seed: int | None = None,
     astar_max_expansions: int | None = 10000,
     n_trajectories: int = 1,
     max_trajectory_length: int | None = None,
@@ -383,17 +386,21 @@ def dagger(
 ) -> keras.Model:
     """DAgger using astar as the teacher, for SquareLightsBoard (Lights Out).
 
+    A fresh set of boards is generated at the start of each iteration.
+
     pi0                      — initial policy from build_square_policy_network
-    initial_boards           — set of starting boards (see build_initial_boards);
-                               every board is rolled out from each iteration
     optimizer                — e.g. keras.optimizers.Adam(1e-3)
     n_iterations             — DAgger iterations
     epochs                   — learn() epochs per iteration
     batch_size               — learn() batch size
+    board_n                  — board size (n×n grid)
+    num_boards               — number of boards to generate per iteration
+    scramble_k               — number of random presses used to scramble boards
+    board_seed               — base seed for board generation; None → random
     astar_max_expansions     — node-expansion budget for the astar teacher;
                                None → search until solved or exhausted
     n_trajectories           — rollouts per initial board per iteration; total
-                               trajectories = len(initial_boards) * n_trajectories
+                               trajectories = num_boards * n_trajectories
     max_trajectory_length    — cap on the number of states collected per rollout;
                                a lane is cut off once it reaches this many states
                                even if unsolved; None → no limit
@@ -438,8 +445,9 @@ def dagger(
         batch_size=batch_size,
         astar_max_expansions=astar_max_expansions,
         n_workers=n_workers,
-        board_n=initial_boards[0].n,
-        n_initial_boards=len(initial_boards),
+        board_n=board_n,
+        num_boards=num_boards,
+        scramble_k=scramble_k,
         dataset_size=0,
     )
 
@@ -454,6 +462,15 @@ def dagger(
               f"(elapsed {elapsed_total:.0f}s, dataset {len(D)} samples)")
         print(f"{'='*60}")
         record(type="iteration_start", iteration=i + 1, dataset_size=len(D))
+
+        iter_seed = None if board_seed is None else board_seed + i * num_boards
+        initial_boards = build_initial_boards(
+            board_n,
+            num_boards=num_boards,
+            scramble_k=scramble_k,
+            seed=iter_seed,
+        )
+        print(f"  generated {len(initial_boards)} boards (scramble_k={scramble_k})")
 
         new_samples_list = _collect_trajectories(
             pi, initial_boards, n_trajectories,
@@ -519,17 +536,7 @@ def main(config_path: str = "config_astar.yaml") -> None:
     bc = cfg["board"]
     n = bc["n"]
 
-    # Initial-board set: random solvable boards built with scramble.
     isc = bc.get("init_set") or {}
-    initial_boards = build_initial_boards(
-        n,
-        num_boards=isc.get("num_boards", 30),
-        scramble_k=isc.get("scramble_k", 10),
-        seed=isc.get("seed"),
-    )
-    print(f"Initial-board set: {len(initial_boards)} boards "
-          f"(num_boards={isc.get('num_boards', 30)}, "
-          f"scramble_k={isc.get('scramble_k', 10)})")
 
     # Network
     nc = cfg["network"]
@@ -562,11 +569,14 @@ def main(config_path: str = "config_astar.yaml") -> None:
 
     dagger(
         pi0=pi0,
-        initial_boards=initial_boards,
         optimizer=optimizer,
         n_iterations=dc["n_iterations"],
         epochs=dc["epochs"],
         batch_size=dc["batch_size"],
+        board_n=n,
+        num_boards=isc.get("num_boards", 30),
+        scramble_k=isc.get("scramble_k", 10),
+        board_seed=isc.get("seed"),
         astar_max_expansions=dc.get("astar_max_expansions", 10000),
         n_trajectories=dc.get("n_trajectories", 1),
         max_trajectory_length=dc.get("max_trajectory_length"),
